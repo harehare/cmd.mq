@@ -584,6 +584,13 @@ def test_extended_registry_configs():
   | assert_eq(parse_output("snap services", "Service Startup Current Notes\nlxd.daemon enabled active -")[0]["service"], "lxd.daemon")
   | assert_eq(parse_output("zfs list", "NAME USED AVAIL REFER MOUNTPOINT\ntank 100G 900G 100G /tank")[0]["name"], "tank")
   | assert_eq(parse_output("zpool list", "NAME SIZE ALLOC FREE CKPOINT EXPANDSZ FRAG CAP DEDUP HEALTH ALTROOT\ntank 1T 100G 900G - - 10% 9% 1.00x ONLINE -")[0]["health"], "ONLINE")
+  | assert_eq(parse_output("ip link", "2: eth0@if3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq state UP mode DEFAULT\n    link/ether 00:11:22:33:44:55 brd ff:ff:ff:ff:ff:ff"), [{"index": 2, "name": "eth0", "flags": ["BROADCAST", "MULTICAST", "UP", "LOWER_UP"], "mtu": 1500, "state": "UP", "mac": "00:11:22:33:44:55"}])
+  | assert_eq(parse_output("ip rule", "0: from all lookup local\n32766: from all lookup main")[1], {"priority": 32766, "selector": "from all", "table": "main"})
+  | assert_eq(parse_output("bridge fdb", "00:11:22:33:44:55 dev eth0 master br0 vlan 10 permanent")[0], {"mac": "00:11:22:33:44:55", "dev": "eth0", "master": "br0", "vlan": 10, "flags": ["permanent"]})
+  | assert_eq(parse_output("git ls-tree", "100644 blob abc1234\tsrc/cmd.mq"), [{"mode": 100644, "type": "blob", "object": "abc1234", "path": "src/cmd.mq"}])
+  | assert_eq(parse_output("timedatectl show", "Timezone=Asia/Tokyo\nNTP=yes"), {"Timezone": "Asia/Tokyo", "NTP": "yes"})
+  | assert_eq(parse_output("rclone lsd", "          -1 2026-09-20 12:00:00        -1 backups")[0], {"size": -1, "date": "2026-09-20", "time": "12:00:00", "path": "backups"})
+  | assert_eq(parse_output("rustc", "rustc 1.82.0 (f6e511eec 2024-10-15)"), {"version": "1.82.0", "commit": "f6e511eec", "date": "2024-10-15"})
 end
 
 def _sig_fixtures():
