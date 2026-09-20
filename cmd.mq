@@ -1,0 +1,2514 @@
+# Command output parsers implemented in mq.
+#
+# Turns the text printed by common CLI commands (ps, df, ls -l, git log, ...)
+# into arrays of dicts, so it can be filtered with mq or rendered as JSON
+# or a Markdown table. Generic parsers (columns_parse, table_parse, kv_parse)
+# keep every value as a string. Command-specific parsers convert only the
+# fields that are plainly numeric.
+
+# Returns the non-blank lines of the input.
+def _lines(input):
+  filter(split(input, "\n"), fn(line): trim(line) != "";)
+end
+
+# Converts a string to a number only when it is a plain integer or decimal.
+def _num(value):
+  if (is_string(value) && is_regex_match(value, "^-?\\d+(\\.\\d+)?$")): to_number(value) else: value
+end
+
+# Normalizes a header name: lowercase, `%cpu` -> `cpu_percent`, `Use%` -> `use_percent`,
+# and `/` or spaces -> `_`.
+def _key(name):
+  let lower = gsub(gsub(gsub(gsub(downcase(name), "/", "_"), " ", "_"), ":", "_"), "@", "")
+  | if (starts_with(lower, "%")): slice(lower, 1, len(lower)) + "_percent"
+    elif (ends_with(lower, "%")): slice(lower, 0, len(lower) - 1) + "_percent"
+    else: lower
+end
+
+# Pairs header names with row values. Missing values become empty strings.
+def _zip_dict(header, row):
+  if (is_empty(header)): {}
+  else: dict(map(range(len(header) - 1), fn(i): [header[i], if (i < len(row)): row[i] else: ""];))
+end
+
+# Splits a line on whitespace into at most n fields. The last field keeps
+# the rest of the line as is, so values with spaces survive.
+def _split_n(line, n):
+  let tokens = split(line, "\\s+")
+  | if (len(tokens) <= n): tokens
+    else:
+      do
+        let rest = capture(line, "^(?:\\S+\\s+){" + to_string(n - 1) + "}(?<rest>.*)$")["rest"]
+        | add(slice(tokens, 0, n - 1), [rest])
+      end
+end
+
+# Parses whitespace-separated columns with a header line into an array of
+# dicts. The last column takes the rest of each line, so it may contain
+# spaces (e.g. the COMMAND column of `ps`).
+#
+# The first line is always treated as the header. Pass `headers` (an array
+# of names) to replace the header names, e.g. when a name contains a space.
+#
+# Example:
+# ```
+# import "cmd" | cmd::columns_parse("PID CMD\n1 init -x\n2 sh")
+# #=> [{"PID": "1", "CMD": "init -x"}, {"PID": "2", "CMD": "sh"}]
+# ```
+#
+# Returns: array
+def columns_parse(input, headers = None):
+  let lines = _lines(input)
+  | if (is_empty(lines)): []
+    else:
+      do
+        let names = if (is_none(headers)): split(trim(first(lines)), "\\s+") else: headers
+        | let n = len(names)
+        | map(slice(lines, 1, len(lines)), fn(line): _zip_dict(names, _split_n(trim(line), n));)
+      end
+end
+
+# Returns the start offset of each column in an aligned header line.
+# A column starts at a non-space character that follows two spaces (or the
+# line start), so header names with a single space ("CONTAINER ID") stay whole.
+def _column_starts(header):
+  filter(range(len(header) - 1), fn(i):
+    slice(header, i, i + 1) != " "
+      && (i == 0 || (slice(header, i - 1, i) == " " && (i == 1 || slice(header, i - 2, i - 1) == " ")));
+  )
+end
+
+# Cuts a line into fields at the given column start offsets.
+def _cut_at(line, starts):
+  map(range(len(starts) - 1), fn(i):
+    let from = starts[i]
+    | let to = if (i + 1 < len(starts)): starts[i + 1] else: len(line)
+    | trim(slice(line, from, to));
+  )
+end
+
+# Parses a table whose columns are aligned under the header line, cutting
+# each row at the header's column offsets. Use it for output whose values
+# contain spaces, such as `docker ps` or `kubectl get`.
+#
+# Example:
+# ```
+# import "cmd" | cmd::table_parse("NAME   STATUS\nweb    Up 2 hours")
+# #=> [{"NAME": "web", "STATUS": "Up 2 hours"}]
+# ```
+#
+# Returns: array
+def table_parse(input):
+  let lines = _lines(input)
+  | if (is_empty(lines)): []
+    else:
+      do
+        let header = first(lines)
+        | let starts = _column_starts(header)
+        | let names = _cut_at(header, starts)
+        | map(slice(lines, 1, len(lines)), fn(line): _zip_dict(names, _cut_at(line, starts));)
+      end
+end
+
+# Parses `key<sep>value` lines into a single dict. Lines without the
+# separator are skipped. Only the first separator splits, so values may
+# contain it. Use `"="` for `env` output.
+#
+# Example:
+# ```
+# import "cmd" | cmd::kv_parse("Name: Alice\nTime: 12:30")
+# #=> {"Name": "Alice", "Time": "12:30"}
+# ```
+#
+# Returns: dict
+def kv_parse(input, sep = ":"):
+  let lines = filter(split(input, "\n"), fn(line): index(line, sep) > 0;)
+  | dict(map(lines, fn(line):
+      let i = index(line, sep)
+      | [trim(slice(line, 0, i)), trim(slice(line, i + len(sep), len(line)))];
+    ))
+end
+
+# Parses blank-line separated `key<sep>value` blocks into an array of dicts.
+#
+# Example:
+# ```
+# import "cmd" | cmd::kv_blocks_parse("a: 1\n\na: 2")
+# #=> [{"a": "1"}, {"a": "2"}]
+# ```
+#
+# Returns: array
+def kv_blocks_parse(input, sep = ":"):
+  split(input, "\n\\s*\n")
+  | map(fn(block): kv_parse(block, sep);)
+  | filter(fn(d): !is_empty(keys(d));)
+end
+
+# Parses `ps aux` / `ps -ef` output. Keys are lowercased header names and
+# pid, ppid, cpu_percent, mem_percent, vsz and rss are numbers.
+#
+# Example:
+# ```
+# import "cmd" | cmd::ps_parse("USER PID %CPU COMMAND\nroot 1 0.5 /sbin/init")
+# #=> [{"user": "root", "pid": 1, "cpu_percent": 0.5, "command": "/sbin/init"}]
+# ```
+#
+# Returns: array
+def ps_parse(input):
+  _by_key("ps", input)
+end
+
+# Parses `df` output. Keys are lowercased header names (`Mounted on` becomes
+# `mounted_on`) and every column except filesystem and mounted_on is a number
+# when it is a plain integer (`df -k`, `df -P`). Human-readable sizes such as
+# "460Gi" stay strings.
+#
+# Example:
+# ```
+# import "cmd" | cmd::df_parse("Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/sda1 100 40 60 40% /")
+# #=> [{"filesystem": "/dev/sda1", "1k-blocks": 100, "used": 40, "available": 60, "use_percent": "40%", "mounted_on": "/"}]
+# ```
+#
+# Returns: array
+def df_parse(input):
+  _by_key("df", input)
+end
+
+# Parses `du` output into `size` and `path`. The size is a number when it is
+# a plain integer (`du -k`), and stays a string for `du -h` (e.g. "4.0K").
+#
+# Example:
+# ```
+# import "cmd" | cmd::du_parse("8\t./src\n16\t.")
+# #=> [{"size": 8, "path": "./src"}, {"size": 16, "path": "."}]
+# ```
+#
+# Returns: array
+def du_parse(input):
+  _by_key("du", input)
+end
+
+# Parses `ls -l` / `ls -la` output. The `total` line and lines that are not
+# entries are skipped. Each entry has type, permissions, links, owner, group,
+# size, modified and name, plus link_target for symlinks.
+#
+# Example:
+# ```
+# import "cmd" | cmd::ls_parse("-rw-r--r--  1 alice staff 12 Jan  1 12:00 a.txt")
+# #=> [{"type": "file", "permissions": "-rw-r--r--", "links": 1, "owner": "alice", "group": "staff", "size": 12, "modified": "Jan 1 12:00", "name": "a.txt"}]
+# ```
+#
+# Returns: array
+def ls_parse(input):
+  _by_key("ls", input)
+end
+
+# Parses the default `git log` format into an array of commits with commit,
+# author, date and message, plus merge and refs when present.
+#
+# Example:
+# ```
+# import "cmd" | cmd::git_log_parse("commit abc123\nAuthor: A <a@x.dev>\nDate:   Mon Jan 1 12:00:00 2024 +0000\n\n    fix bug\n")
+# #=> [{"commit": "abc123", "author": "A <a@x.dev>", "date": "Mon Jan 1 12:00:00 2024 +0000", "message": "fix bug"}]
+# ```
+#
+# Returns: array
+def git_log_parse(input):
+  _by_key("git log", input)
+end
+
+# Parses `git status --porcelain` (or `--short`) into one dict per changed
+# path with the raw `index` and `worktree` status codes and the `path`.
+# Renames also have `orig_path`. Branch lines (`-b`) are skipped, and
+# quoted paths are kept as printed.
+#
+# Example:
+# ```
+# import "cmd" | cmd::git_status_parse(" M src/a.rs\n?? new.txt")
+# #=> [{"index": " ", "worktree": "M", "path": "src/a.rs"}, {"index": "?", "worktree": "?", "path": "new.txt"}]
+# ```
+#
+# Returns: array
+def git_status_parse(input):
+  _by_key("git status", input)
+end
+
+# Parses `git branch` into `name` and `current`. With `-v`, each branch also
+# has `commit` and `message`.
+#
+# Example:
+# ```
+# import "cmd" | cmd::git_branch_parse("* main\n  dev")
+# #=> [{"name": "main", "current": true}, {"name": "dev", "current": false}]
+# ```
+#
+# Returns: array
+def git_branch_parse(input):
+  _by_key("git branch", input)
+end
+
+# Parses `id` output into uid, user, gid, group and groups (an array of
+# {"id", "name"}). Returns an empty dict when the input is not `id` output.
+#
+# Example:
+# ```
+# import "cmd" | cmd::id_parse("uid=501(alice) gid=20(staff) groups=20(staff),12(everyone)")
+# #=> {"uid": 501, "user": "alice", "gid": 20, "group": "staff", "groups": [{"id": 20, "name": "staff"}, {"id": 12, "name": "everyone"}]}
+# ```
+#
+# Returns: dict
+def id_parse(input):
+  _by_key("id", input)
+end
+
+# Parses default `wc` output (lines, words, bytes) into one dict per line,
+# with `file` when a file name is printed (including the `total` line).
+#
+# Example:
+# ```
+# import "cmd" | cmd::wc_parse("  1  3  6 a.txt")
+# #=> [{"lines": 1, "words": 3, "bytes": 6, "file": "a.txt"}]
+# ```
+#
+# Returns: array
+def wc_parse(input):
+  _by_key("wc", input)
+end
+
+# Parses the summary of `ping` (macOS and Linux) into transmitted, received
+# and loss_percent, plus rtt_min, rtt_avg, rtt_max and rtt_stddev in
+# milliseconds when replies arrived. Returns an empty dict without a summary.
+#
+# Example:
+# ```
+# import "cmd" | cmd::ping_parse("2 packets transmitted, 2 packets received, 0.0% packet loss\nround-trip min/avg/max/stddev = 0.6/0.9/1.1/0.2 ms")
+# #=> {"transmitted": 2, "received": 2, "loss_percent": 0, "rtt_min": 0.6, "rtt_avg": 0.9, "rtt_max": 1.1, "rtt_stddev": 0.2}
+# ```
+#
+# Returns: dict
+def ping_parse(input):
+  _by_key("ping", input)
+end
+
+# Parses `lsof` output. Keys are lowercased header names (`SIZE/OFF` becomes
+# `size_off`) and pid is a number. NAME keeps the rest of the line.
+#
+# Example:
+# ```
+# import "cmd" | cmd::lsof_parse("COMMAND PID USER FD NAME\nzsh 42 alice cwd /tmp/my dir")
+# #=> [{"command": "zsh", "pid": 42, "user": "alice", "fd": "cwd", "name": "/tmp/my dir"}]
+# ```
+#
+# Returns: array
+def lsof_parse(input):
+  _by_key("lsof", input)
+end
+
+# Parses Linux `free` output into one dict per row (`Mem`, `Swap`) with
+# `type` and the lowercased column names (`buff/cache` becomes `buff_cache`).
+# Values are numbers, except `free -h` sizes such as "15Gi".
+#
+# Example:
+# ```
+# import "cmd" | cmd::free_parse("       total  used  free\nMem:    100    40    60\nSwap:    10     0    10")
+# #=> [{"type": "Mem", "total": 100, "used": 40, "free": 60}, {"type": "Swap", "total": 10, "used": 0, "free": 10}]
+# ```
+#
+# Returns: array
+def free_parse(input):
+  _by_key("free", input)
+end
+
+# Returns the start offset of each column in a `-----  -----` separator line.
+def _dash_starts(line):
+  filter(range(len(line) - 1), fn(i): slice(line, i, i + 1) == "-" && (i == 0 || slice(line, i - 1, i) == " ");)
+end
+
+# Parses `pip list` output. The dashed separator line gives the column
+# offsets, so header names with spaces ("Editable project location") work.
+# Keys are lowercased with spaces replaced by underscores, and versions
+# stay strings.
+#
+# Example:
+# ```
+# import "cmd" | cmd::pip_list_parse("Package Version\n------- -------\npip     26.1.1")
+# #=> [{"package": "pip", "version": "26.1.1"}]
+# ```
+#
+# Returns: array
+def pip_list_parse(input):
+  _by_key("pip list", input)
+end
+
+# Returns the lines from the first one matching `pattern` to the end, or an
+# empty array when no line matches.
+def _from_match(lines, pattern):
+  let hits = filter(range(len(lines) - 1), fn(i): is_regex_match(lines[i], pattern);)
+  | if (is_empty(hits)): [] else: slice(lines, hits[0], len(lines))
+end
+
+# Groups lines into blocks. A line matching `pattern` starts a new block, and
+# lines before the first such line are dropped.
+def _group_lines(lines, pattern):
+  fold(lines, [], fn(acc, line):
+    if (is_regex_match(line, pattern)): add(acc, [[line]])
+    elif (is_empty(acc)): acc
+    else: add(slice(acc, 0, len(acc) - 1), [add(last(acc), [line])]);
+  )
+end
+
+# Returns the non-blank lines of the input, trimmed.
+#
+# Example:
+# ```
+# import "cmd" | cmd::lines_parse("a\n\n b \n")
+# #=> ["a", "b"]
+# ```
+#
+# Returns: array
+def lines_parse(input):
+  _by_key("lines", input)
+end
+
+# Parses `uniq -c` output into count and value.
+#
+# Example:
+# ```
+# import "cmd" | cmd::uniq_c_parse("  3 foo\n  1 bar baz")
+# #=> [{"count": 3, "value": "foo"}, {"count": 1, "value": "bar baz"}]
+# ```
+#
+# Returns: array
+def uniq_c_parse(input):
+  _by_key("uniq", input)
+end
+
+# Parses `grep -n` / `grep -rn` output into file, line and text. Without
+# `-n` the line number is omitted. Lines without a file prefix are skipped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::grep_parse("a.rs:12:let x = 1;")
+# #=> [{"file": "a.rs", "line": 12, "text": "let x = 1;"}]
+# ```
+#
+# Returns: array
+def grep_parse(input):
+  _by_key("grep", input)
+end
+
+# Parses `file` output into path and description.
+#
+# Example:
+# ```
+# import "cmd" | cmd::file_parse("a.txt: ASCII text")
+# #=> [{"path": "a.txt", "description": "ASCII text"}]
+# ```
+#
+# Returns: array
+def file_parse(input):
+  _by_key("file", input)
+end
+
+# Parses `md5`, `shasum`, `sha256sum` and similar output into hash and file
+# (plus algorithm for the BSD `MD5 (file) = hash` format).
+#
+# Example:
+# ```
+# import "cmd" | cmd::checksum_parse("d41d8cd98f00b204e9800998ecf8427e  empty.txt")
+# #=> [{"hash": "d41d8cd98f00b204e9800998ecf8427e", "file": "empty.txt"}]
+# ```
+#
+# Returns: array
+def checksum_parse(input):
+  _by_key("checksum", input)
+end
+
+# Parses `pgrep` / `pgrep -l` / `pgrep -fl` output into pid and name.
+#
+# Example:
+# ```
+# import "cmd" | cmd::pgrep_parse("123 zsh\n456")
+# #=> [{"pid": 123, "name": "zsh"}, {"pid": 456}]
+# ```
+#
+# Returns: array
+def pgrep_parse(input):
+  _by_key("pgrep", input)
+end
+
+# Parses `arp -a` output into host, ip, mac and interface.
+#
+# Example:
+# ```
+# import "cmd" | cmd::arp_parse("? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]")
+# #=> [{"host": "?", "ip": "192.168.1.1", "mac": "aa:bb:cc:dd:ee:ff", "interface": "en0"}]
+# ```
+#
+# Returns: array
+def arp_parse(input):
+  _by_key("arp", input)
+end
+
+# Parses `uptime` (macOS and Linux) into time, uptime, users, load_1, load_5
+# and load_15. Returns an empty dict when the input is not `uptime` output.
+#
+# Example:
+# ```
+# import "cmd" | cmd::uptime_parse("12:34  up 5 days,  3:21, 2 users,  load averages: 1.23 1.45 1.67")
+# #=> {"time": "12:34", "uptime": "5 days,  3:21", "users": 2, "load_1": 1.23, "load_5": 1.45, "load_15": 1.67}
+# ```
+#
+# Returns: dict
+def uptime_parse(input):
+  _by_key("uptime", input)
+end
+
+# Parses `who` output into user, tty, login and host (when printed).
+#
+# Example:
+# ```
+# import "cmd" | cmd::who_parse("alice ttys000 Sep 20 12:01 (10.0.0.5)")
+# #=> [{"user": "alice", "tty": "ttys000", "login": "Sep 20 12:01", "host": "10.0.0.5"}]
+# ```
+#
+# Returns: array
+def who_parse(input):
+  _by_key("who", input)
+end
+
+# Parses the table of `w` (the uptime line is skipped). Keys are lowercased
+# header names, with `LOGIN@` becoming `login`.
+#
+# Example:
+# ```
+# import "cmd" | cmd::w_parse("12:34 up 1 day\nUSER TTY FROM LOGIN@ IDLE WHAT\nalice ttys000 - 09:00 1 -zsh")
+# #=> [{"user": "alice", "tty": "ttys000", "from": "-", "login": "09:00", "idle": "1", "what": "-zsh"}]
+# ```
+#
+# Returns: array
+def w_parse(input):
+  _by_key("w", input)
+end
+
+# Parses `mount` output into device, mount_point, type and options (an
+# array). On macOS the type is the first option in parentheses.
+#
+# Example:
+# ```
+# import "cmd" | cmd::mount_parse("sysfs on /sys type sysfs (rw,nosuid)")
+# #=> [{"device": "sysfs", "mount_point": "/sys", "type": "sysfs", "options": ["rw", "nosuid"]}]
+# ```
+#
+# Returns: array
+def mount_parse(input):
+  _by_key("mount", input)
+end
+
+# Parses `uname -a` (macOS and Linux) into kernel_name, node_name,
+# kernel_release, kernel_version and machine. Returns an empty dict for fewer than 5 fields.
+#
+# Example:
+# ```
+# import "cmd" | cmd::uname_parse("Linux host 5.15.0 #1 SMP Mon x86_64 x86_64 x86_64 GNU/Linux")
+# #=> {"kernel_name": "Linux", "node_name": "host", "kernel_release": "5.15.0", "kernel_version": "#1 SMP Mon", "machine": "x86_64"}
+# ```
+#
+# Returns: dict
+def uname_parse(input):
+  _by_key("uname", input)
+end
+
+# Parses `sysctl` output (`key: value` on macOS, `key = value` on Linux) into
+# one dict. Values stay strings, and lines that are not a single-line
+# key/value pair are skipped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::sysctl_parse("hw.ncpu: 12\nkernel.ostype = Linux")
+# #=> {"hw.ncpu": "12", "kernel.ostype": "Linux"}
+# ```
+#
+# Returns: dict
+def sysctl_parse(input):
+  _by_key("sysctl", input)
+end
+
+# Parses macOS `vm_stat` output into a dict of numbers. Keys are lowercased
+# with underscores (`Pages free` becomes `pages_free`), plus `page_size`.
+#
+# Example:
+# ```
+# import "cmd" | cmd::vm_stat_parse("Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:    100.")
+# #=> {"page_size": 16384, "pages_free": 100}
+# ```
+#
+# Returns: dict
+def vm_stat_parse(input):
+  _by_key("vm_stat", input)
+end
+
+# Parses Linux `vmstat` output. The second header line (`r b swpd ...`) names
+# the columns, and every value is a number.
+#
+# Example:
+# ```
+# import "cmd" | cmd::vmstat_parse("procs ---memory---\n r  b  free\n 1  0  100")
+# #=> [{"r": 1, "b": 0, "free": 100}]
+# ```
+#
+# Returns: array
+def vmstat_parse(input):
+  _by_key("vmstat", input)
+end
+
+# Parses the process table of `top` (macOS `top -l 1` or Linux `top -bn1`),
+# skipping the summary lines. Keys are lowercased header names, and pid,
+# cpu_percent and mem_percent are numbers when plain.
+#
+# Example:
+# ```
+# import "cmd" | cmd::top_parse("load avg\n  PID USER %CPU COMMAND\n  1 root 0.5 init")
+# #=> [{"pid": 1, "user": "root", "cpu_percent": 0.5, "command": "init"}]
+# ```
+#
+# Returns: array
+def top_parse(input):
+  _by_key("top", input)
+end
+
+# Parses `launchctl list` (macOS) into pid, status and label. A pid of `-`
+# (not running) becomes None.
+#
+# Example:
+# ```
+# import "cmd" | cmd::launchctl_list_parse("PID\tStatus\tLabel\n-\t0\tcom.example.job\n123\t0\tcom.example.run")
+# #=> [{"pid": None, "status": 0, "label": "com.example.job"}, {"pid": 123, "status": 0, "label": "com.example.run"}]
+# ```
+#
+# Returns: array
+def launchctl_list_parse(input):
+  _by_key("launchctl", input)
+end
+
+# Parses `ifconfig` (macOS and net-tools) into one dict per interface with
+# name, flags (array), mtu, ether, status, ipv4 (array of {address,
+# netmask}) and ipv6 (array of {address, prefixlen}).
+#
+# Example:
+# ```
+# import "cmd" | cmd::ifconfig_parse("lo0: flags=8049<UP,LOOPBACK> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000")
+# #=> [{"name": "lo0", "flags": ["UP", "LOOPBACK"], "mtu": 16384, "ipv4": [{"address": "127.0.0.1", "netmask": "0xff000000"}], "ipv6": []}]
+# ```
+#
+# Returns: array
+def ifconfig_parse(input):
+  _by_key("ifconfig", input)
+end
+
+# Parses `netstat -an` / `netstat -tulpn` connection lines into proto, recv_q,
+# send_q, local_address, foreign_address, and state and program when printed.
+# Header, unix socket and routing lines are skipped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::netstat_parse("tcp4 0 0 127.0.0.1.8080 *.* LISTEN")
+# #=> [{"proto": "tcp4", "recv_q": 0, "send_q": 0, "local_address": "127.0.0.1.8080", "foreign_address": "*.*", "state": "LISTEN"}]
+# ```
+#
+# Returns: array
+def netstat_parse(input):
+  _by_key("netstat", input)
+end
+
+# Strips one pair of surrounding double or single quotes from a string.
+def _unquote(value):
+  if (is_string(value) && len(value) >= 2 && ((starts_with(value, "\"") && ends_with(value, "\"")) || (starts_with(value, "'") && ends_with(value, "'")))): slice(value, 1, len(value) - 1) else: value
+end
+
+# Parses macOS `mdls` output (`key = value`) into a dict. Quotes are removed,
+# `(null)` becomes None, and multi-line values are skipped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::mdls_parse("kMDItemKind = \"Text\"\nkMDItemNote = (null)")
+# #=> {"kMDItemKind": "Text", "kMDItemNote": None}
+# ```
+#
+# Returns: dict
+def mdls_parse(input):
+  _by_key("mdls", input)
+end
+
+# Parses macOS `otool -L` output into path, compatibility_version and current_version.
+#
+# Example:
+# ```
+# import "cmd" | cmd::otool_l_parse("/bin/ls:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1351.0.0)")
+# #=> [{"path": "/usr/lib/libSystem.B.dylib", "compatibility_version": "1.0.0", "current_version": "1351.0.0"}]
+# ```
+#
+# Returns: array
+def otool_l_parse(input):
+  _by_key("otool", input)
+end
+
+# Parses `unzip -l` output into size, date, time and name. The header,
+# separator and total lines are skipped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::unzip_list_parse("  Length      Date    Time    Name\n---------  ---------- -----   ----\n      12  2024-01-01 12:00   a.txt\n---------                     -------\n      12                     1 file")
+# #=> [{"size": 12, "date": "2024-01-01", "time": "12:00", "name": "a.txt"}]
+# ```
+#
+# Returns: array
+def unzip_list_parse(input):
+  _by_key("unzip", input)
+end
+
+# Parses `tar -tvf` output. GNU tar lines give permissions, owner, size,
+# modified and name. bsdtar (macOS) lines use the `ls -l` layout and give
+# the same keys as ls_parse.
+#
+# Example:
+# ```
+# import "cmd" | cmd::tar_parse("-rw-r--r-- alice/staff 12 2024-01-01 12:00 a.txt")
+# #=> [{"permissions": "-rw-r--r--", "owner": "alice/staff", "size": 12, "modified": "2024-01-01 12:00", "name": "a.txt"}]
+# ```
+#
+# Returns: array
+def tar_parse(input):
+  _by_key("tar", input)
+end
+
+# Parses `git log --oneline` (optionally decorated) into commit, message and
+# refs when present.
+#
+# Example:
+# ```
+# import "cmd" | cmd::git_log_oneline_parse("abc1234 (HEAD -> main) fix bug\ndef5678 add feature")
+# #=> [{"commit": "abc1234", "message": "fix bug", "refs": "HEAD -> main"}, {"commit": "def5678", "message": "add feature"}]
+# ```
+#
+# Returns: array
+def git_log_oneline_parse(input):
+  _by_key("git log --oneline", input)
+end
+
+# Parses `git shortlog -sn` / `-sne` into commits, author and email (with `-e`).
+#
+# Example:
+# ```
+# import "cmd" | cmd::git_shortlog_parse("    12\tAlice <a@x.dev>")
+# #=> [{"commits": 12, "author": "Alice", "email": "a@x.dev"}]
+# ```
+#
+# Returns: array
+def git_shortlog_parse(input):
+  _by_key("git shortlog", input)
+end
+
+# Parses `git remote -v` into name, url and direction (fetch or push).
+#
+# Example:
+# ```
+# import "cmd" | cmd::git_remote_parse("origin\thttps://example.com/r.git (fetch)")
+# #=> [{"name": "origin", "url": "https://example.com/r.git", "direction": "fetch"}]
+# ```
+#
+# Returns: array
+def git_remote_parse(input):
+  _by_key("git remote", input)
+end
+
+# Parses `git stash list` into index, ref, branch and message.
+#
+# Example:
+# ```
+# import "cmd" | cmd::git_stash_list_parse("stash@{0}: WIP on main: abc1234 fix bug")
+# #=> [{"index": 0, "ref": "stash@{0}", "branch": "main", "message": "abc1234 fix bug"}]
+# ```
+#
+# Returns: array
+def git_stash_list_parse(input):
+  _by_key("git stash", input)
+end
+
+# Parses `git reflog` into commit, ref, action and message.
+#
+# Example:
+# ```
+# import "cmd" | cmd::git_reflog_parse("abc1234 HEAD@{0}: commit: fix bug")
+# #=> [{"commit": "abc1234", "ref": "HEAD@{0}", "action": "commit", "message": "fix bug"}]
+# ```
+#
+# Returns: array
+def git_reflog_parse(input):
+  _by_key("git reflog", input)
+end
+
+# Parses `git diff --numstat` into added, deleted and path. Binary files
+# have None counts.
+#
+# Example:
+# ```
+# import "cmd" | cmd::git_diff_numstat_parse("12\t3\tsrc/a.rs\n-\t-\timg.png")
+# #=> [{"added": 12, "deleted": 3, "path": "src/a.rs"}, {"added": None, "deleted": None, "path": "img.png"}]
+# ```
+#
+# Returns: array
+def git_diff_numstat_parse(input):
+  _by_key("git diff --numstat", input)
+end
+
+# Parses `git diff --stat` into files (path and changes, or binary: true) and
+# the summary counts files_changed, insertions and deletions.
+#
+# Example:
+# ```
+# import "cmd" | cmd::git_diff_stat_parse(" src/a.rs | 5 ++---\n 1 file changed, 2 insertions(+), 3 deletions(-)")
+# #=> {"files": [{"path": "src/a.rs", "changes": 5}], "files_changed": 1, "insertions": 2, "deletions": 3}
+# ```
+#
+# Returns: dict
+def git_diff_stat_parse(input):
+  let lines = _lines(input)
+  | let files = map(filter(map(lines, fn(line): capture(line, "^\\s*(?<path>.+?)\\s+\\|\\s+(?<changes>\\d+|Bin)\\b");), fn(m): !is_empty(keys(m));), fn(m): if (m["changes"] == "Bin"): {"path": m["path"], "binary": true} else: {"path": m["path"], "changes": to_number(m["changes"])};)
+  | let total = capture(input, "(?<files>\\d+) files? changed")
+  | let ins = capture(input, "(?<n>\\d+) insertions?\\(\\+\\)")
+  | let del = capture(input, "(?<n>\\d+) deletions?\\(-\\)")
+  | {"files": files, "files_changed": if (is_empty(keys(total))): 0 else: to_number(total["files"]), "insertions": if (is_empty(keys(ins))): 0 else: to_number(ins["n"]), "deletions": if (is_empty(keys(del))): 0 else: to_number(del["n"])}
+end
+
+# Parses `git worktree list` into path, commit, and branch or state.
+#
+# Example:
+# ```
+# import "cmd" | cmd::git_worktree_parse("/repo  abc1234 [main]")
+# #=> [{"path": "/repo", "commit": "abc1234", "branch": "main"}]
+# ```
+#
+# Returns: array
+def git_worktree_parse(input):
+  _by_key("git worktree", input)
+end
+
+# Parses `pip freeze` into name and version (`name==version`) or name and
+# url (`name @ url`).
+#
+# Example:
+# ```
+# import "cmd" | cmd::pip_freeze_parse("requests==2.31.0\nmypkg @ file:///src/mypkg")
+# #=> [{"name": "requests", "version": "2.31.0"}, {"name": "mypkg", "url": "file:///src/mypkg"}]
+# ```
+#
+# Returns: array
+def pip_freeze_parse(input):
+  _by_key("pip freeze", input)
+end
+
+# Parses `pip show` (one or more packages separated by `---`) into dicts
+# keyed by the printed field names.
+#
+# Example:
+# ```
+# import "cmd" | cmd::pip_show_parse("Name: pip\nVersion: 26.1.1")
+# #=> [{"Name": "pip", "Version": "26.1.1"}]
+# ```
+#
+# Returns: array
+def pip_show_parse(input):
+  _by_key("pip show", input)
+end
+
+# Parses `brew list --versions` (or `brew list`) into name and versions (an array).
+#
+# Example:
+# ```
+# import "cmd" | cmd::brew_list_parse("jq 1.7.1\ngit 2.45.0 2.44.0")
+# #=> [{"name": "jq", "versions": ["1.7.1"]}, {"name": "git", "versions": ["2.45.0", "2.44.0"]}]
+# ```
+#
+# Returns: array
+def brew_list_parse(input):
+  _by_key("brew list", input)
+end
+
+# Parses `brew outdated --verbose` into name, installed_versions (an array)
+# and current_version. Plain `brew outdated` lines give the name only.
+#
+# Example:
+# ```
+# import "cmd" | cmd::brew_outdated_parse("jq (1.6) < 1.7.1")
+# #=> [{"name": "jq", "installed_versions": ["1.6"], "current_version": "1.7.1"}]
+# ```
+#
+# Returns: array
+def brew_outdated_parse(input):
+  _by_key("brew outdated", input)
+end
+
+# Parses `gem list` into name and versions (an array; `default: x.y` entries are kept as printed).
+#
+# Example:
+# ```
+# import "cmd" | cmd::gem_list_parse("rake (13.0.6, default: 12.0)")
+# #=> [{"name": "rake", "versions": ["13.0.6", "default: 12.0"]}]
+# ```
+#
+# Returns: array
+def gem_list_parse(input):
+  _by_key("gem list", input)
+end
+
+# Parses `cargo install --list` into name, version, binaries (an array) and
+# source when the crate was installed from a path or git URL.
+#
+# Example:
+# ```
+# import "cmd" | cmd::cargo_install_list_parse("mq-run v0.8.5:\n    mq")
+# #=> [{"name": "mq-run", "version": "0.8.5", "binaries": ["mq"]}]
+# ```
+#
+# Returns: array
+def cargo_install_list_parse(input):
+  _by_key("cargo install", input)
+end
+
+# Parses `npm ls` (tree output) into name, version and depth (1 for direct
+# dependencies). The root project line and non-package lines are skipped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::npm_ls_parse("app@1.0.0 /src/app\n├── left-pad@1.3.0\n└── @scope/pkg@2.0.0")
+# #=> [{"name": "left-pad", "version": "1.3.0", "depth": 1}, {"name": "@scope/pkg", "version": "2.0.0", "depth": 1}]
+# ```
+#
+# Returns: array
+def npm_ls_parse(input):
+  _by_key("npm ls", input)
+end
+
+# Parses `dpkg -l` into status, name, version, architecture and description.
+#
+# Example:
+# ```
+# import "cmd" | cmd::dpkg_list_parse("ii  adduser  3.118  all  add and remove users")
+# #=> [{"status": "ii", "name": "adduser", "version": "3.118", "architecture": "all", "description": "add and remove users"}]
+# ```
+#
+# Returns: array
+def dpkg_list_parse(input):
+  _by_key("dpkg", input)
+end
+
+# Parses `apt list` into name, suite, version, architecture and status (when printed).
+#
+# Example:
+# ```
+# import "cmd" | cmd::apt_list_parse("curl/jammy-updates,now 7.81.0-1 amd64 [installed]")
+# #=> [{"name": "curl", "suite": "jammy-updates,now", "version": "7.81.0-1", "architecture": "amd64", "status": "installed"}]
+# ```
+#
+# Returns: array
+def apt_list_parse(input):
+  _by_key("apt list", input)
+end
+
+# Parses `pacman -Q` (or any `name version` lines) into name and version.
+#
+# Example:
+# ```
+# import "cmd" | cmd::pacman_q_parse("linux 6.6.1.arch1-1")
+# #=> [{"name": "linux", "version": "6.6.1.arch1-1"}]
+# ```
+#
+# Returns: array
+def pacman_q_parse(input):
+  _by_key("pacman", input)
+end
+
+# Parses `conda list` into name, version, build and channel. Comment lines are skipped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::conda_list_parse("# Name Version Build Channel\nnumpy 1.26.4 py311h1 conda-forge")
+# #=> [{"name": "numpy", "version": "1.26.4", "build": "py311h1", "channel": "conda-forge"}]
+# ```
+#
+# Returns: array
+def conda_list_parse(input):
+  _by_key("conda list", input)
+end
+
+# Parses `dnf list installed` / `yum list installed` into name, architecture, version and repo.
+#
+# Example:
+# ```
+# import "cmd" | cmd::dnf_list_parse("bash.x86_64  5.2.15-3.fc39  @anaconda")
+# #=> [{"name": "bash", "architecture": "x86_64", "version": "5.2.15-3.fc39", "repo": "@anaconda"}]
+# ```
+#
+# Returns: array
+def dnf_list_parse(input):
+  _by_key("dnf list", input)
+end
+
+# Parses `helm list` (tab-separated) into one dict per release with
+# lowercased keys (`APP VERSION` becomes `app_version`) and a numeric revision.
+#
+# Example:
+# ```
+# import "cmd" | cmd::helm_list_parse("NAME\tREVISION\tSTATUS\nweb\t3\tdeployed")
+# #=> [{"name": "web", "revision": 3, "status": "deployed"}]
+# ```
+#
+# Returns: array
+def helm_list_parse(input):
+  _by_key("helm list", input)
+end
+
+# Parses `ip addr` (full or `-br` brief format). The full format gives index,
+# name, flags (array), mtu, state, mac, ipv4 and ipv6 (arrays of CIDR
+# strings). The brief format gives name, state and addresses.
+#
+# Example:
+# ```
+# import "cmd" | cmd::ip_addr_parse("lo UNKNOWN 127.0.0.1/8 ::1/128")
+# #=> [{"name": "lo", "state": "UNKNOWN", "addresses": ["127.0.0.1/8", "::1/128"]}]
+# ```
+#
+# Returns: array
+def ip_addr_parse(input):
+  _by_key("ip addr", input)
+end
+
+# Parses `ip route` into one dict per route with destination, plus type,
+# via, dev, proto, scope, src, metric and other key/value fields when printed
+# (numbers when plain) and `flags` for bare words such as `linkdown`.
+#
+# Example:
+# ```
+# import "cmd" | cmd::ip_route_parse("default via 192.168.1.1 dev eth0 proto dhcp metric 100")
+# #=> [{"destination": "default", "via": "192.168.1.1", "dev": "eth0", "proto": "dhcp", "metric": 100}]
+# ```
+#
+# Returns: array
+def ip_route_parse(input):
+  _by_key("ip route", input)
+end
+
+# Parses `ss` output into state, recv_q, send_q, local_address, peer_address,
+# and netid and process when printed. Addresses stay as `host:port` strings.
+#
+# Example:
+# ```
+# import "cmd" | cmd::ss_parse("Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\ntcp LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*")
+# #=> [{"netid": "tcp", "state": "LISTEN", "recv_q": 0, "send_q": 4096, "local_address": "0.0.0.0:22", "peer_address": "0.0.0.0:*"}]
+# ```
+#
+# Returns: array
+def ss_parse(input):
+  _by_key("ss", input)
+end
+
+# Parses `lsblk` (tree glyphs are removed from names) into lowercased keys
+# (`MAJ:MIN` becomes `maj_min`) with numeric rm and ro.
+#
+# Example:
+# ```
+# import "cmd" | cmd::lsblk_parse("NAME MAJ:MIN RM SIZE RO TYPE MOUNTPOINTS\n├─sda1 8:1 0 100G 0 part /boot")
+# #=> [{"name": "sda1", "maj_min": "8:1", "rm": 0, "size": "100G", "ro": 0, "type": "part", "mountpoints": "/boot"}]
+# ```
+#
+# Returns: array
+def lsblk_parse(input):
+  _by_key("lsblk", input)
+end
+
+# Parses `blkid` into device plus lowercased attributes (uuid, type, ...).
+#
+# Example:
+# ```
+# import "cmd" | cmd::blkid_parse("/dev/sda1: UUID=\"abc\" TYPE=\"ext4\"")
+# #=> [{"device": "/dev/sda1", "uuid": "abc", "type": "ext4"}]
+# ```
+#
+# Returns: array
+def blkid_parse(input):
+  _by_key("blkid", input)
+end
+
+# Parses `lsmod` into module, size, used and used_by (a comma-separated string).
+#
+# Example:
+# ```
+# import "cmd" | cmd::lsmod_parse("Module Size Used by\nnf_tables 250000 5 nft_ct,nft_chain")
+# #=> [{"module": "nf_tables", "size": 250000, "used": 5, "used_by": "nft_ct,nft_chain"}]
+# ```
+#
+# Returns: array
+def lsmod_parse(input):
+  _by_key("lsmod", input)
+end
+
+# Parses `lspci` into slot, class and description.
+#
+# Example:
+# ```
+# import "cmd" | cmd::lspci_parse("00:1f.2 SATA controller: Intel Corporation 82801")
+# #=> [{"slot": "00:1f.2", "class": "SATA controller", "description": "Intel Corporation 82801"}]
+# ```
+#
+# Returns: array
+def lspci_parse(input):
+  _by_key("lspci", input)
+end
+
+# Parses `lsusb` into bus, device (both strings, as printed), id and description.
+#
+# Example:
+# ```
+# import "cmd" | cmd::lsusb_parse("Bus 001 Device 002: ID 8087:0024 Intel Corp. Hub")
+# #=> [{"bus": "001", "device": "002", "id": "8087:0024", "description": "Intel Corp. Hub"}]
+# ```
+#
+# Returns: array
+def lsusb_parse(input):
+  _by_key("lsusb", input)
+end
+
+# Parses `dmesg` into time and message. The time is a number of seconds, or
+# the printed date string with `dmesg -T`.
+#
+# Example:
+# ```
+# import "cmd" | cmd::dmesg_parse("[   12.345678] usb 1-1: new device")
+# #=> [{"time": 12.345678, "message": "usb 1-1: new device"}]
+# ```
+#
+# Returns: array
+def dmesg_parse(input):
+  _by_key("dmesg", input)
+end
+
+# Parses syslog-format lines (`journalctl`, `/var/log/syslog`) into timestamp,
+# host, process, pid (when printed) and message.
+#
+# Example:
+# ```
+# import "cmd" | cmd::syslog_parse("Sep 20 12:00:01 web sshd[123]: Accepted key")
+# #=> [{"timestamp": "Sep 20 12:00:01", "host": "web", "process": "sshd", "message": "Accepted key", "pid": 123}]
+# ```
+#
+# Returns: array
+def syslog_parse(input):
+  _by_key("syslog", input)
+end
+
+# Parses the table of `systemctl list-units` / `list-unit-files` (the footer
+# after the first blank line is dropped, and `●` markers are removed) into
+# lowercased keys (`UNIT FILE` becomes `unit_file`).
+#
+# Example:
+# ```
+# import "cmd" | cmd::systemctl_parse("UNIT LOAD ACTIVE SUB DESCRIPTION\nssh.service loaded active running OpenBSD Secure Shell server\n\n1 loaded units listed.")
+# #=> [{"unit": "ssh.service", "load": "loaded", "active": "active", "sub": "running", "description": "OpenBSD Secure Shell server"}]
+# ```
+#
+# Returns: array
+def systemctl_parse(input):
+  _by_key("systemctl", input)
+end
+
+# Parses `ldd` into name, path and address. A library that is not found has
+# a None path.
+#
+# Example:
+# ```
+# import "cmd" | cmd::ldd_parse("\tlibc.so.6 => /lib/libc.so.6 (0x00007f00)\n\tlibx.so => not found")
+# #=> [{"name": "libc.so.6", "path": "/lib/libc.so.6", "address": "0x00007f00"}, {"name": "libx.so", "path": None}]
+# ```
+#
+# Returns: array
+def ldd_parse(input):
+  _by_key("ldd", input)
+end
+
+# Parses one `traceroute` hop line.
+def _hop_entry(line):
+  let m = capture(line, "^\\s*(?<hop>\\d+)\\s+(?<rest>.*)$")
+  | if (is_empty(keys(m))): m
+    else:
+      do
+        let rtts = map(regex_match(m["rest"], "[\\d.]+ ms"), fn(s): to_number(slice(s, 0, len(s) - 3));)
+        | let first_token = first(split(trim(m["rest"]), "\\s+"))
+        | let paren = capture(m["rest"], "\\((?<ip>[^)]+)\\)")
+        | let base = {"hop": to_number(m["hop"]), "rtts": rtts}
+        | if (first_token == "*"): base
+          elif (is_empty(keys(paren))): set(base, "ip", first_token)
+          else: set(set(base, "host", first_token), "ip", paren["ip"])
+      end
+end
+
+# Parses `traceroute` into hop, host (when resolved), ip and rtts (an array of
+# milliseconds) for the first responder of each hop. A hop with no reply has empty rtts.
+#
+# Example:
+# ```
+# import "cmd" | cmd::traceroute_parse(" 1  gw (192.168.1.1)  1.2 ms  1.1 ms")
+# #=> [{"hop": 1, "rtts": [1.2, 1.1], "host": "gw", "ip": "192.168.1.1"}]
+# ```
+#
+# Returns: array
+def traceroute_parse(input):
+  map(_lines(input), _hop_entry)
+  | filter(fn(entry): !is_empty(keys(entry));)
+end
+
+# Parses `dig` answer records (any section) into name, ttl, class, type and data.
+#
+# Example:
+# ```
+# import "cmd" | cmd::dig_parse("example.com. 300 IN A 93.184.216.34")
+# #=> [{"name": "example.com.", "ttl": 300, "class": "IN", "type": "A", "data": "93.184.216.34"}]
+# ```
+#
+# Returns: array
+def dig_parse(input):
+  _by_key("dig", input)
+end
+
+# Parses HTTP response headers (`curl -I` / `curl -i`, the last response in a
+# redirect chain) into http_version, status, reason and headers (a dict with
+# lowercased names).
+#
+# Example:
+# ```
+# import "cmd" | cmd::curl_headers_parse("HTTP/2 200\r\nContent-Type: text/html\r\n")
+# #=> {"http_version": "2", "status": 200, "headers": {"content-type": "text/html"}}
+# ```
+#
+# Returns: dict
+def curl_headers_parse(input):
+  _by_key("curl", input)
+end
+
+# Parses `ssh-keygen -l` into bits, fingerprint, comment and type.
+#
+# Example:
+# ```
+# import "cmd" | cmd::ssh_keygen_parse("256 SHA256:abc alice@host (ED25519)")
+# #=> [{"bits": 256, "fingerprint": "SHA256:abc", "comment": "alice@host", "type": "ED25519"}]
+# ```
+#
+# Returns: array
+def ssh_keygen_parse(input):
+  _by_key("ssh-keygen", input)
+end
+
+# Parses `/etc/passwd` (or `getent passwd`) into user, password, uid, gid, comment, home and shell.
+#
+# Example:
+# ```
+# import "cmd" | cmd::passwd_parse("root:x:0:0:root:/root:/bin/bash")
+# #=> [{"user": "root", "password": "x", "uid": 0, "gid": 0, "comment": "root", "home": "/root", "shell": "/bin/bash"}]
+# ```
+#
+# Returns: array
+def passwd_parse(input):
+  _by_key("passwd", input)
+end
+
+# Parses `/etc/group` (or `getent group`) into name, password, gid and members (an array).
+#
+# Example:
+# ```
+# import "cmd" | cmd::group_parse("staff:*:20:alice,bob")
+# #=> [{"name": "staff", "password": "*", "gid": 20, "members": ["alice", "bob"]}]
+# ```
+#
+# Returns: array
+def group_parse(input):
+  _by_key("group", input)
+end
+
+# Parses `/etc/hosts` into ip, hostname and aliases (an array). Comments and blank lines are skipped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::hosts_parse("127.0.0.1 localhost lo # loopback")
+# #=> [{"ip": "127.0.0.1", "hostname": "localhost", "aliases": ["lo"]}]
+# ```
+#
+# Returns: array
+def hosts_parse(input):
+  _by_key("hosts", input)
+end
+
+# Parses `KEY=value` lines with optional quotes (`/etc/os-release`, `locale`)
+# into one dict. Comment lines are skipped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::os_release_parse("NAME=\"Ubuntu\"\nVERSION_ID=\"22.04\"")
+# #=> {"NAME": "Ubuntu", "VERSION_ID": "22.04"}
+# ```
+#
+# Returns: dict
+def os_release_parse(input):
+  _by_key("os-release", input)
+end
+
+# Converts shell `time` output (`real 0m1.234s` or the POSIX `real 1.23`) to
+# seconds.
+#
+# Example:
+# ```
+# import "cmd" | cmd::time_parse("real\t0m1.500s\nuser\t0m0.250s\nsys\t0m0.100s")
+# #=> {"real": 1.5, "user": 0.25, "sys": 0.1}
+# ```
+#
+# Returns: dict
+def time_parse(input):
+  let rows = filter(map(_lines(input), fn(line): capture(trim(line), "^(?<name>real|user|sys)\\s+(?:(?<min>\\d+)m)?(?<sec>[\\d.]+)s?$");), fn(m): !is_empty(keys(m));)
+  | dict(map(rows, fn(m): [m["name"], (if (is_none(m["min"])): 0 else: to_number(m["min"]) * 60) + to_number(m["sec"])];))
+end
+
+# Parses `snap list` into lowercased keys with a numeric rev.
+#
+# Example:
+# ```
+# import "cmd" | cmd::snap_list_parse("Name Version Rev Tracking Publisher Notes\ncore20 20240111 2182 latest/stable canonical** base")
+# #=> [{"name": "core20", "version": "20240111", "rev": 2182, "tracking": "latest/stable", "publisher": "canonical**", "notes": "base"}]
+# ```
+#
+# Returns: array
+def snap_list_parse(input):
+  _by_key("snap list", input)
+end
+
+# Parses `date` output (`Sun Sep 20 16:48:49 JST 2026`) into weekday, month,
+# day, time, timezone and year. Returns an empty dict for other text.
+#
+# Example:
+# ```
+# import "cmd" | cmd::date_parse("Sun Sep 20 16:48:49 JST 2026")
+# #=> {"weekday": "Sun", "month": "Sep", "day": 20, "time": "16:48:49", "timezone": "JST", "year": 2026}
+# ```
+#
+# Returns: dict
+def date_parse(input):
+  _by_key("date", input)
+end
+
+# Wraps the output of `hostname` as {"hostname": ...}.
+#
+# Example:
+# ```
+# import "cmd" | cmd::hostname_parse("web-01\n")
+# #=> {"hostname": "web-01"}
+# ```
+#
+# Returns: dict
+def hostname_parse(input):
+  _by_key("hostname", input)
+end
+
+# Wraps the output of `whoami` as {"user": ...}.
+#
+# Example:
+# ```
+# import "cmd" | cmd::whoami_parse("alice\n")
+# #=> {"user": "alice"}
+# ```
+#
+# Returns: dict
+def whoami_parse(input):
+  _by_key("whoami", input)
+end
+
+# Parses `stat` output. macOS/BSD prints one line per file in the default
+# format, and GNU prints a `File:` block per file. Both give one dict per
+# file: BSD has path, device, inode, mode, links, owner, group, rdev, size,
+# atime, mtime, ctime, birthtime, blksize, blocks and flags, and GNU has file,
+# size, blocks, io_block, type, device, inode, links, mode, permissions, uid,
+# user, gid, group, access, modify, change and birth.
+#
+# Example:
+# ```
+# import "cmd" | cmd::stat_parse("1 2 -rw-r--r-- 1 root wheel 0 230 \"Aug 15 11:07:33 2026\" \"Aug 15 11:07:33 2026\" \"Sep 15 21:14:34 2026\" \"Aug  2 08:15:31 2026\" 4096 8 0 /etc/hosts")[0]["size"]
+# #=> 230
+# ```
+#
+# Returns: array
+def stat_parse(input):
+  _by_key("stat", input)
+end
+
+# Returns the regex (without capture groups) of one `last` line or footer.
+def _last_line_re():
+  "\\S+\\s+\\S+\\s+(?:\\S.*?\\s+)?[A-Z][a-z]{2} [A-Z][a-z]{2}\\s+\\d{1,2} \\d{2}:\\d{2}(?::\\d{2})?(?: \\d{4})?(?:\\s+[^\\n]*)?|(?:wtmp|btmp) begins[^\\n]*"
+end
+
+# Parses `last` into user, tty, host (when printed), login and session
+# (the logout time and duration, or `still logged in`). The `wtmp begins`
+# footer is skipped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::last_parse("alice  ttys000  Sat Sep 19 09:00 - 10:00  (01:00)")
+# #=> [{"user": "alice", "tty": "ttys000", "login": "Sat Sep 19 09:00", "session": "- 10:00  (01:00)"}]
+# ```
+#
+# Returns: array
+def last_parse(input):
+  _by_key("last", input)
+end
+
+# Parses the Linux `route -n` routing table into lowercased keys with
+# numeric metric, ref and use.
+#
+# Example:
+# ```
+# import "cmd" | cmd::route_parse("Kernel IP routing table\nDestination Gateway Genmask Flags Metric Ref Use Iface\n0.0.0.0 192.168.1.1 0.0.0.0 UG 100 0 0 eth0")
+# #=> [{"destination": "0.0.0.0", "gateway": "192.168.1.1", "genmask": "0.0.0.0", "flags": "UG", "metric": 100, "ref": 0, "use": 0, "iface": "eth0"}]
+# ```
+#
+# Returns: array
+def route_parse(input):
+  _by_key("route", input)
+end
+
+# Parses `zipinfo` into one dict per entry with permissions, version, os,
+# size, flags, method, date, time and name. The archive header and summary
+# lines are skipped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::zipinfo_parse("-rw-r--r--  3.0 unx        6 tx stor 26-Sep-20 14:38 a.txt")
+# #=> [{"permissions": "-rw-r--r--", "version": "3.0", "os": "unx", "size": 6, "flags": "tx", "method": "stor", "date": "26-Sep-20", "time": "14:38", "name": "a.txt"}]
+# ```
+#
+# Returns: array
+def zipinfo_parse(input):
+  _by_key("zipinfo", input)
+end
+
+# Parses `gzip -l` into compressed, uncompressed, ratio and uncompressed_name
+# (`ratio` stays a string such as `50.0%`).
+#
+# Example:
+# ```
+# import "cmd" | cmd::gzip_list_parse("  compressed  uncompressed  ratio uncompressed_name\n         30          12 -150.0% a.txt")
+# #=> [{"compressed": 30, "uncompressed": 12, "ratio": "-150.0%", "uncompressed_name": "a.txt"}]
+# ```
+#
+# Returns: array
+def gzip_list_parse(input):
+  _by_key("gzip", input)
+end
+
+# Parses `hexdump -C` into offset, bytes (hex digits without spaces) and
+# ascii. Repeated-line markers (`*`) and the final offset line are skipped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::hexdump_parse("00000000  68 65 6c 6c 6f 0a                                 |hello.|\n00000006")
+# #=> [{"offset": "00000000", "bytes": "68656c6c6f0a", "ascii": "hello."}]
+# ```
+#
+# Returns: array
+def hexdump_parse(input):
+  _by_key("hexdump", input)
+end
+
+# Parses `cksum` (or `sum`) into checksum, size and file (when printed).
+#
+# Example:
+# ```
+# import "cmd" | cmd::cksum_parse("4294967295 0 empty.txt")
+# #=> [{"checksum": 4294967295, "size": 0, "file": "empty.txt"}]
+# ```
+#
+# Returns: array
+def cksum_parse(input):
+  _by_key("cksum", input)
+end
+
+# Parses `tree` output into name, depth and path (joined with `/`, without
+# the root) for every entry. The root line and the summary line are skipped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::tree_parse(".\n├── src\n│   └── a.rs\n└── README.md\n\n1 directory, 2 files")
+# #=> [{"name": "src", "depth": 1, "path": "src"}, {"name": "a.rs", "depth": 2, "path": "src/a.rs"}, {"name": "README.md", "depth": 1, "path": "README.md"}]
+# ```
+#
+# Returns: array
+def tree_parse(input):
+  _by_key("tree", input)
+end
+
+# Parses `getconf -a` (`NAME value` on Linux, `NAME: value` on macOS) into one
+# dict. Plain numbers become numbers.
+#
+# Example:
+# ```
+# import "cmd" | cmd::getconf_parse("ARG_MAX 2097152\nPATH: /usr/bin")
+# #=> {"ARG_MAX": 2097152, "PATH": "/usr/bin"}
+# ```
+#
+# Returns: dict
+def getconf_parse(input):
+  _by_key("getconf", input)
+end
+
+# Parses macOS `diskutil list` into one dict per disk with device,
+# description and partitions (index, type, name, size, identifier).
+#
+# Example:
+# ```
+# import "cmd" | cmd::diskutil_list_parse("/dev/disk0 (internal, physical):\n   #:  TYPE NAME  SIZE  IDENTIFIER\n   1:  Apple_APFS Container disk3  245.1 GB  disk0s2")
+# #=> [{"device": "/dev/disk0", "description": "internal, physical", "partitions": [{"index": 1, "type": "Apple_APFS", "name": "Container disk3", "size": "245.1 GB", "identifier": "disk0s2"}]}]
+# ```
+#
+# Returns: array
+def diskutil_list_parse(input):
+  _by_key("diskutil list", input)
+end
+
+# Parses macOS `pmset -g batt` into source and batteries (name, id, percent,
+# state, remaining when printed, present).
+#
+# Example:
+# ```
+# import "cmd" | cmd::pmset_batt_parse("Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1)\t57%; discharging; 5:38 remaining present: true")
+# #=> {"source": "Battery Power", "batteries": [{"name": "InternalBattery-0", "id": 1, "percent": 57, "state": "discharging", "remaining": "5:38 remaining", "present": true}]}
+# ```
+#
+# Returns: dict
+def pmset_batt_parse(input):
+  _by_key("pmset batt", input)
+end
+
+# Parses macOS `csrutil status` into {"status": "enabled" or "disabled"}.
+#
+# Example:
+# ```
+# import "cmd" | cmd::csrutil_parse("System Integrity Protection status: enabled.")
+# #=> {"status": "enabled"}
+# ```
+#
+# Returns: dict
+def csrutil_parse(input):
+  _by_key("csrutil", input)
+end
+
+# Parses macOS `spctl --status` into {"assessments": "enabled" or "disabled"}.
+#
+# Example:
+# ```
+# import "cmd" | cmd::spctl_parse("assessments enabled")
+# #=> {"assessments": "enabled"}
+# ```
+#
+# Returns: dict
+def spctl_parse(input):
+  _by_key("spctl", input)
+end
+
+# Parses macOS `memory_pressure` into a dict. The first line gives
+# memory_bytes, pages and page_size, and the `Name: number` lines follow with
+# normalized keys (`Pages free` becomes `pages_free`).
+#
+# Example:
+# ```
+# import "cmd" | cmd::memory_pressure_parse("The system has 8589934592 (524288 pages with a page size of 16384).\nPages free: 4435 ")
+# #=> {"memory_bytes": 8589934592, "pages": 524288, "page_size": 16384, "pages_free": 4435}
+# ```
+#
+# Returns: dict
+def memory_pressure_parse(input):
+  _by_key("memory_pressure", input)
+end
+
+# Parses `lsattr` into attributes and path.
+#
+# Example:
+# ```
+# import "cmd" | cmd::lsattr_parse("--------------e------- ./a.txt")
+# #=> [{"attributes": "--------------e-------", "path": "./a.txt"}]
+# ```
+#
+# Returns: array
+def lsattr_parse(input):
+  _by_key("lsattr", input)
+end
+
+# Parses `findmnt` (tree glyphs are removed from `target`) into lowercased keys.
+#
+# Example:
+# ```
+# import "cmd" | cmd::findmnt_parse("TARGET SOURCE FSTYPE OPTIONS\n/ /dev/sda1 ext4 rw,relatime\n├─/sys sysfs sysfs rw")
+# #=> [{"target": "/", "source": "/dev/sda1", "fstype": "ext4", "options": "rw,relatime"}, {"target": "/sys", "source": "sysfs", "fstype": "sysfs", "options": "rw"}]
+# ```
+#
+# Returns: array
+def findmnt_parse(input):
+  _by_key("findmnt", input)
+end
+
+# Parses `swapon --show` into lowercased keys with a numeric prio.
+#
+# Example:
+# ```
+# import "cmd" | cmd::swapon_parse("NAME TYPE SIZE USED PRIO\n/swapfile file 2G 0B -2")
+# #=> [{"name": "/swapfile", "type": "file", "size": "2G", "used": "0B", "prio": -2}]
+# ```
+#
+# Returns: array
+def swapon_parse(input):
+  _by_key("swapon", input)
+end
+
+# Parses `getfacl` into one dict per file with file, owner, group and
+# entries (the ACL lines as printed).
+#
+# Example:
+# ```
+# import "cmd" | cmd::getfacl_parse("# file: a\n# owner: root\n# group: root\nuser::rw-\nother::r--")
+# #=> [{"file": "a", "entries": ["user::rw-", "other::r--"], "owner": "root", "group": "root"}]
+# ```
+#
+# Returns: array
+def getfacl_parse(input):
+  _by_key("getfacl", input)
+end
+
+# Parses `getcap` into path and capabilities.
+#
+# Example:
+# ```
+# import "cmd" | cmd::getcap_parse("/usr/bin/ping cap_net_raw=ep")
+# #=> [{"path": "/usr/bin/ping", "capabilities": "cap_net_raw=ep"}]
+# ```
+#
+# Returns: array
+def getcap_parse(input):
+  _by_key("getcap", input)
+end
+
+# Parses `host` output into one dict per record with name, type (A, AAAA,
+# CNAME, MX, TXT, NS or PTR), value, and priority for MX.
+#
+# Example:
+# ```
+# import "cmd" | cmd::host_parse("example.com has address 93.184.216.34\nexample.com mail is handled by 10 mail.example.com.")
+# #=> [{"name": "example.com", "type": "A", "value": "93.184.216.34"}, {"name": "example.com", "type": "MX", "value": "mail.example.com.", "priority": 10}]
+# ```
+#
+# Returns: array
+def host_parse(input):
+  _by_key("host", input)
+end
+
+# Parses `nslookup` into server, server_address and answers (name and
+# addresses per `Name:` block).
+#
+# Example:
+# ```
+# import "cmd" | cmd::nslookup_parse("Server:\t8.8.8.8\nAddress:\t8.8.8.8#53\n\nName:\texample.com\nAddress: 93.184.216.34")
+# #=> {"server": "8.8.8.8", "server_address": "8.8.8.8#53", "answers": [{"name": "example.com", "addresses": ["93.184.216.34"]}]}
+# ```
+#
+# Returns: dict
+def nslookup_parse(input):
+  _by_key("nslookup", input)
+end
+
+# Parses `loginctl list-sessions` and `list-users` into lowercased keys with
+# a numeric uid. The footer after the table is dropped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::loginctl_parse("SESSION UID USER SEAT TTY\n      1 1000 alice seat0 tty1\n\n1 sessions listed.")
+# #=> [{"session": "1", "uid": 1000, "user": "alice", "seat": "seat0", "tty": "tty1"}]
+# ```
+#
+# Returns: array
+def loginctl_parse(input):
+  _by_key("loginctl list-sessions", input)
+end
+
+# Parses `lsns` into lowercased keys with numeric nprocs and pid.
+#
+# Example:
+# ```
+# import "cmd" | cmd::lsns_parse("        NS TYPE   NPROCS PID USER COMMAND\n4026531835 cgroup    120   1 root /sbin/init")
+# #=> [{"ns": "4026531835", "type": "cgroup", "nprocs": 120, "pid": 1, "user": "root", "command": "/sbin/init"}]
+# ```
+#
+# Returns: array
+def lsns_parse(input):
+  _by_key("lsns", input)
+end
+
+# Parses `lslocks` into lowercased keys with a numeric pid.
+#
+# Example:
+# ```
+# import "cmd" | cmd::lslocks_parse("COMMAND PID TYPE SIZE MODE M START END PATH\nsshd 812 FLOCK 0B WRITE 0 0 0 /run/sshd.pid")
+# #=> [{"command": "sshd", "pid": 812, "type": "FLOCK", "size": "0B", "mode": "WRITE", "m": "0", "start": "0", "end": "0", "path": "/run/sshd.pid"}]
+# ```
+#
+# Returns: array
+def lslocks_parse(input):
+  _by_key("lslocks", input)
+end
+
+# Parses the `lsmem` block table (the summary after the first blank line is dropped).
+#
+# Example:
+# ```
+# import "cmd" | cmd::lsmem_parse("RANGE SIZE STATE REMOVABLE BLOCK\n0x0-0x7fffffff 2G online yes 0-15\n\nMemory block size: 128M")
+# #=> [{"range": "0x0-0x7fffffff", "size": "2G", "state": "online", "removable": "yes", "block": "0-15"}]
+# ```
+#
+# Returns: array
+def lsmem_parse(input):
+  _by_key("lsmem", input)
+end
+
+# Parses `lslogins` into lowercased keys with numeric uid and proc.
+#
+# Example:
+# ```
+# import "cmd" | cmd::lslogins_parse("UID USER PROC PWD-LOCK PWD-DENY LAST-LOGIN GECOS\n0 root 120 0 0 2026-09-20T12:00:00 root")
+# #=> [{"uid": 0, "user": "root", "proc": 120, "pwd-lock": "0", "pwd-deny": "0", "last-login": "2026-09-20T12:00:00", "gecos": "root"}]
+# ```
+#
+# Returns: array
+def lslogins_parse(input):
+  _by_key("lslogins", input)
+end
+
+# Parses `rpm -qa` into name, version, release and arch.
+#
+# Example:
+# ```
+# import "cmd" | cmd::rpm_qa_parse("bash-5.2.15-3.fc39.x86_64")
+# #=> [{"name": "bash", "version": "5.2.15", "release": "3.fc39", "arch": "x86_64"}]
+# ```
+#
+# Returns: array
+def rpm_qa_parse(input):
+  _by_key("rpm", input)
+end
+
+# Parses `apt-cache madison` into package, version and source.
+#
+# Example:
+# ```
+# import "cmd" | cmd::apt_cache_madison_parse("      curl |   7.81.0-1ubuntu1 | http://archive.ubuntu.com/ubuntu jammy/main amd64 Packages")
+# #=> [{"package": "curl", "version": "7.81.0-1ubuntu1", "source": "http://archive.ubuntu.com/ubuntu jammy/main amd64 Packages"}]
+# ```
+#
+# Returns: array
+def apt_cache_madison_parse(input):
+  _by_key("apt-cache madison", input)
+end
+
+# Parses `apt-cache search` into package and description.
+#
+# Example:
+# ```
+# import "cmd" | cmd::apt_cache_search_parse("curl - command line tool for transferring data with URL syntax")
+# #=> [{"package": "curl", "description": "command line tool for transferring data with URL syntax"}]
+# ```
+#
+# Returns: array
+def apt_cache_search_parse(input):
+  _by_key("apt-cache search", input)
+end
+
+# Parses `dpkg -s` / `dpkg-query -s` into one dict per package with the
+# printed field names. Continuation lines (indented) are dropped.
+#
+# Example:
+# ```
+# import "cmd" | cmd::dpkg_status_parse("Package: curl\nStatus: install ok installed\nVersion: 7.81.0")
+# #=> [{"Package": "curl", "Status": "install ok installed", "Version": "7.81.0"}]
+# ```
+#
+# Returns: array
+def dpkg_status_parse(input):
+  _by_key("dpkg status", input)
+end
+
+# Parses bash `ulimit -a` into name, flag, value (a number or `unlimited`)
+# and unit when printed.
+#
+# Example:
+# ```
+# import "cmd" | cmd::ulimit_parse("core file size          (blocks, -c) 0\nopen files                      (-n) 256")
+# #=> [{"name": "core file size", "flag": "-c", "value": 0, "unit": "blocks"}, {"name": "open files", "flag": "-n", "value": 256}]
+# ```
+#
+# Returns: array
+def ulimit_parse(input):
+  _by_key("ulimit", input)
+end
+
+# Builds a signature for text made only of lines matching `pattern` (blank
+# lines allowed), anchored at both ends of the window.
+def _shape(pattern):
+  let p = "(?:" + pattern + ")"
+  | "\\A\\n*(?:" + p + "\\n+)*" + p + "\\n*\\z"
+end
+
+# Definition engine. A registry entry describes a parser as data: `parse` is
+# a spec dict (or a function for formats the engine cannot express), and
+# `fields` holds the per-field rules. Adding a command means adding an entry.
+#
+# Spec types:
+#   regex      one dict per line, from the named groups of `patterns` (the
+#              first pattern that matches wins; a pattern is a string or
+#              {"re": ..., "set": {constants}}). `trim` trims each line first,
+#              `single: true` returns one dict (or {}) instead of an array, and
+#              `as: "map"` turns rows with `key` and `value` groups into one
+#              dict (`normalize_keys: true` lowercases the keys).
+#   columns    whitespace columns under a header line, the last column takes
+#              the rest of the line. `headers` replaces the header names,
+#              `prefix_headers` adds names for columns the header leaves
+#              unnamed, and `header: false` says there is no header line.
+#   aligned    columns cut at the header's offsets (two or more spaces between
+#              names, or `offsets: "dashes"` for a `---- ----` separator line).
+#              `keys: "raw"` keeps the header names as printed.
+#   delimited  rows split on `separator` (default tab) under a header line.
+#   kv         one dict from `key<separator>value` lines (`blocks: true` gives
+#              an array of dicts from blank-line separated blocks, `unquote`
+#              removes surrounding quotes).
+#   words      one dict per line of words: the first word is `first`, a word in
+#              `keys` takes the next word as its value, other words go to a
+#              `flags` array (`prefix_types` lists words that may come first).
+#   lines      the trimmed non-blank lines.
+#   record     one dict from the first match of every pattern over the whole
+#              text (`require` lists the keys that must be captured), or from
+#              `captures`.
+#   blocks     one dict per block, where a line matching `start` begins a
+#              block. Each block is read by `captures`, a list of
+#              {"re": ...} entries: a plain one adds the groups of its first
+#              match, and {"re": ..., "all": true, "into": key} collects every
+#              match into an array (`values: true` keeps only the `value`
+#              group, `join` makes a string, `fields` types the rows, `merge`
+#              builds a dict from `key`/`value` groups, `within` limits the
+#              text, and `blocks` nests another blocks spec). `last: true`
+#              returns only the last block as one dict.
+#   choice     the first of `options` ({"when": regex, "parse": spec, "fields":
+#              rules}) whose `when` matches the text.
+#   indent     nested dicts from an indented listing: a line with a deeper
+#              line after it is a section, the others are `key<separator>value`
+#              (`unquote` removes quotes around keys and values).
+#   tree       one dict per line of a glyph tree: `pattern` has an `indent`
+#              group, `unit` is the indent width per level, `base` the depth of
+#              the first level, and `path: true` adds the path from `name`.
+#
+# Input options for every type: `replace` ([[regex, text], ...] on the whole
+# text), `start_at` (drop the lines before the first match), `until_blank`
+# (keep the first block only), `strip` (regex removed from each line) and
+# `skip` (regexes of lines to ignore).
+#
+# Field rules, keyed by the field name (`*` matches any other field):
+# `type` (int and float turn plain numbers into numbers, bool, array,
+# string), `null_if`, `trim_suffix`, `remove`, `true_values`, `false_values`,
+# `split`, `rename`, `trim`, `squeeze` (collapse whitespace), `default` and
+# `derive` (both fill a missing field; `derive` is {"op": "prefix"|"basename",
+# "from": field, ...}) and `keep_empty`.
+
+# Converts a bool by the rule's true_values and false_values.
+def _convert_bool(text, rule):
+  if (has(rule, "true_values") && contains(rule["true_values"], text)): true
+  elif (has(rule, "false_values") && contains(rule["false_values"], text)): false
+  else: text
+end
+
+# Converts an array by splitting on the rule's `split` regex (default a comma).
+def _convert_array(text, rule):
+  if (text == ""): [] else: split(text, if (has(rule, "split")): rule["split"] else: ",\\s*")
+end
+
+# Applies one field rule to a string value.
+def _convert(value, rule):
+  let raw = if (has(rule, "trim") && rule["trim"]): trim(value) else: value
+  | let removed = if (has(rule, "remove")): gsub(raw, rule["remove"], "") else: raw
+  | let text = if (has(rule, "squeeze") && rule["squeeze"]): gsub(removed, "\\s+", " ") else: removed
+  | let cut = if (has(rule, "trim_suffix") && ends_with(text, rule["trim_suffix"])): slice(text, 0, len(text) - len(rule["trim_suffix"])) else: text
+  | let kind = if (has(rule, "type")): rule["type"] else: "string"
+  | if (has(rule, "null_if") && contains(rule["null_if"], cut)): None
+    elif (kind == "int" || kind == "float"): _num(cut)
+    elif (kind == "bool"): _convert_bool(cut, rule)
+    elif (kind == "array"): _convert_array(cut, rule)
+    else: cut
+end
+
+# Applies the field rule of one key. Returns [key, value], or None when an
+# empty string is dropped.
+def _field_pair(key, value, fields, keep):
+  let rule = if (has(fields, key)): fields[key] elif (has(fields, "*")): fields["*"] else: None
+  | let converted = if (is_none(rule) || !is_string(value)): value else: _convert(value, rule)
+  | let out_key = if (!is_none(rule) && has(rule, "rename")): rule["rename"] else: key
+  | let keep_it = if (!is_none(rule) && has(rule, "keep_empty")): rule["keep_empty"] else: keep
+  | if (is_string(converted) && converted == "" && !keep_it): None else: [out_key, converted]
+end
+
+# Computes a derived field from another field of the row. `prefix` maps the
+# first character of the source (with a `default`), and `basename` takes the
+# last path component.
+def _derive(row, rule):
+  let source = row[rule["from"]]
+  | if (rule["op"] == "basename"): basename(source)
+    elif (has(rule["map"], slice(source, 0, 1))): rule["map"][slice(source, 0, 1)]
+    else: rule["default"]
+end
+
+# Adds the value of one rule to a row when the field is missing: the `default`,
+# or the result of `derive` when its source field is a string.
+def _fill(acc, key, rule):
+  if (!is_dict(rule) || has(acc, key)): acc
+  elif (has(rule, "derive") && has(acc, rule["derive"]["from"]) && is_string(acc[rule["derive"]["from"]])): set(acc, key, _derive(acc, rule["derive"]))
+  elif (has(rule, "default")): set(acc, key, rule["default"])
+  else: acc
+end
+
+# Applies the field rules to a row, then fills the fields that are missing
+# with their `default` or `derive` rule.
+def _apply_fields(row, fields, keep):
+  let done = dict(filter(map(entries(row), fn(kv): _field_pair(kv[0], kv[1], fields, keep);), fn(pair): !is_none(pair);))
+  | fold(entries(fields), done, fn(acc, kv): _fill(acc, kv[0], kv[1]);)
+end
+
+# Returns the spec's `keep_empty` option, or the default for its type.
+def _keep_empty(spec, default):
+  if (has(spec, "keep_empty")): spec["keep_empty"] else: default
+end
+
+# Returns true when a line matches one of the spec's `skip` regexes.
+def _skipped(spec, line):
+  has(spec, "skip") && contains(map(spec["skip"], fn(re): is_regex_match(line, re);), true)
+end
+
+# Returns the input text after the spec's `replace` and `until_blank` options.
+def _spec_text(spec, output):
+  let replaced = fold(if (has(spec, "replace")): spec["replace"] else: [], output, fn(acc, pair): gsub(acc, pair[0], pair[1]);)
+  | if (has(spec, "until_blank") && spec["until_blank"]): first(split(trim(replaced), "\n\\s*\n")) else: replaced
+end
+
+# Returns the non-blank lines of the input after the spec's input options.
+def _spec_lines(spec, output):
+  let all = split(_spec_text(spec, output), "\n")
+  | let started = if (has(spec, "start_at")): _from_match(all, spec["start_at"]) else: all
+  | let stripped = if (has(spec, "strip")): map(started, fn(line): gsub(line, spec["strip"], "");) else: started
+  | let trimmed = if (has(spec, "trim") && spec["trim"]): map(stripped, trim) else: stripped
+  | filter(trimmed, fn(line): trim(line) != "" && !_skipped(spec, line);)
+end
+
+# Matches a line against one pattern (a string or {"re", "set"}).
+def _match_pattern(line, pattern):
+  let re = if (is_string(pattern)): pattern else: pattern["re"]
+  | let m = capture(line, re)
+  | if (is_empty(keys(m)) || is_string(pattern) || !has(pattern, "set")): m else: m + pattern["set"]
+end
+
+# Returns the captures of the first pattern that matches the line, or {}.
+def _match_line(line, patterns):
+  let hits = filter(map(patterns, fn(p): _match_pattern(line, p);), fn(m): !is_empty(keys(m));)
+  | if (is_empty(hits)): {} else: hits[0]
+end
+
+# Returns the key of a `key`/`value` row, normalized when the spec asks for it.
+def _row_key(spec, key):
+  if (has(spec, "normalize_keys") && spec["normalize_keys"]): _key(key) else: key
+end
+
+def _spec_regex(spec, fields, output):
+  let patterns = if (has(spec, "patterns")): spec["patterns"] else: [spec["pattern"]]
+  | let rows = filter(map(_spec_lines(spec, output), fn(line): _match_line(line, patterns);), fn(m): !is_empty(keys(m));)
+  | if (has(spec, "as") && spec["as"] == "map"): dict(filter(map(rows, fn(m): _field_pair(_row_key(spec, m["key"]), m["value"], fields, _keep_empty(spec, true));), fn(pair): !is_none(pair);))
+    else:
+      do
+        let done = map(rows, fn(m): _apply_fields(m, fields, _keep_empty(spec, false));)
+        | if (has(spec, "single") && spec["single"]): if (is_empty(done)): {} else: first(done)
+          else: done
+      end
+end
+
+# Joins the values of a capture into a string, trimmed when the capture asks.
+def _joined(values, cap):
+  let text = join(values, cap["join"])
+  | if (has(cap, "trim") && cap["trim"]): trim(text) else: text
+end
+
+# Shapes the rows of an `all` capture: the `value` group of each row (`values`,
+# turned into numbers with `type: "int"`), or the rows as dicts with the
+# capture's own `fields`. `join` turns the values into one string.
+def _capture_value(cap, rows):
+  let shaped = if (has(cap, "values") && cap["values"]): map(rows, fn(r): if (has(cap, "type")): _num(r["value"]) else: r["value"];) else: map(rows, fn(r): _apply_fields(r, if (has(cap, "fields")): cap["fields"] else: {}, has(cap, "keep_empty") && cap["keep_empty"]);)
+  | if (has(cap, "join")): _joined(shaped, cap) else: shaped
+end
+
+# Collects every match of an `all` capture: an array under `into`, or with
+# `merge` one dict from the `key` and `value` groups (keys normalized), placed
+# under `into` when it is given.
+def _capture_all(text, cap):
+  let rows = map(regex_match(text, cap["re"]), fn(m): capture(m, cap["re"]);)
+  | if (has(cap, "merge") && cap["merge"]): if (has(cap, "into")): set({}, cap["into"], dict(map(rows, fn(r): [_key(r["key"]), r["value"]];))) else: dict(map(rows, fn(r): [_key(r["key"]), r["value"]];))
+    else: set({}, cap["into"], _capture_value(cap, rows))
+end
+
+# Applies one capture to a text. A plain capture gives the groups of its first
+# match, and `all` collects every match. `within` restricts the capture to the
+# `value` group of another regex (nothing is captured when that one does not
+# match), and `blocks` reads the text as nested blocks under `into`.
+def _capture_apply(text, cap):
+  let scope = if (has(cap, "within")): capture(text, cap["within"]) else: None
+  | let source = if (is_none(scope)): text elif (has(scope, "value")): scope["value"] else: None
+  | if (is_none(source)): {}
+    elif (has(cap, "blocks")): set({}, cap["into"], _spec_blocks(cap["blocks"], if (has(cap, "fields")): cap["fields"] else: {}, source))
+    elif (has(cap, "all") && cap["all"]): _capture_all(source, cap)
+    else: capture(source, cap["re"])
+end
+
+# Merges the captures of a text into one dict. Returns {} unless every key in
+# `require` was captured.
+def _capture_block(text, spec, fields):
+  let merged = fold(spec["captures"], {}, fn(acc, cap): acc + _capture_apply(text, cap);)
+  | let needed = if (has(spec, "require")): spec["require"] else: []
+  | if (!is_empty(filter(needed, fn(k): !has(merged, k);))): {}
+    else: _apply_fields(merged, fields, _keep_empty(spec, false))
+end
+
+# Reads a text as one dict, from `captures` or from the first match of every pattern.
+def _spec_record(spec, fields, output):
+  let text = _spec_text(spec, output)
+  | if (has(spec, "captures")): _capture_block(text, spec, fields)
+    else:
+      do
+        let merged = fold(spec["patterns"], {}, fn(acc, p): acc + capture(text, if (is_string(p)): p else: p["re"]);)
+        | let needed = if (has(spec, "require")): spec["require"] else: []
+        | if (!is_empty(filter(needed, fn(k): !has(merged, k);))): {}
+          else: _apply_fields(merged, fields, _keep_empty(spec, false))
+      end
+end
+
+# Splits the text into blocks that start at a line matching `start`, and reads
+# every block as one dict from `captures`. Blocks without every `require` key are dropped.
+def _spec_blocks(spec, fields, output):
+  let groups = _group_lines(filter(split(_spec_text(spec, output), "\n"), fn(line): !_skipped(spec, line);), spec["start"])
+  | let blocks = filter(map(groups, fn(g): _capture_block(join(g, "\n"), spec, fields);), fn(d): !is_empty(keys(d));)
+  | if (has(spec, "last") && spec["last"]): if (is_empty(blocks)): {} else: last(blocks)
+    else: blocks
+end
+
+# Runs the first option whose `when` regex matches the text (an option without
+# `when` matches anything). Each option has its own `parse` and `fields`.
+def _spec_choice(spec, fields, output):
+  let hits = filter(spec["options"], fn(o): !has(o, "when") || is_regex_match(output, "(?m)" + o["when"]);)
+  | if (is_empty(hits)): []
+    else:
+      do
+        let o = first(hits)
+        | _run_spec(o["parse"], if (has(o, "fields")): o["fields"] else: {}, output)
+      end
+end
+
+# Reads one line of an indented listing as {"indent", "key", "value"}. A line
+# without the separator is a header with an empty value.
+def _indent_item(line, sep, unquote):
+  let body = trim(line)
+  | let indent = len(line) - len(ltrim(line))
+  | let i = index(body, sep)
+  | let shape = fn(text): if (unquote): _unquote(text) else: text;
+  | if (i > 0): {"indent": indent, "key": shape(trim(slice(body, 0, i))), "value": shape(trim(slice(body, i + len(sep), len(body))))}
+    else: {"indent": indent, "key": shape(body), "value": ""}
+end
+
+# Marks the items that have deeper items after them as sections.
+def _indent_sections(items):
+  if (is_empty(items)): []
+  else: map(range(len(items) - 1), fn(i): set(items[i], "section", i + 1 < len(items) && items[i + 1]["indent"] > items[i]["indent"]);)
+end
+
+# Adds the path of the enclosing section names to every item.
+def _indent_paths(items):
+  fold(items, {"stack": [], "out": []}, fn(acc, it):
+    let stack = filter(acc["stack"], fn(s): s[0] < it["indent"];)
+    | let next_stack = if (it["section"]): add(stack, [[it["indent"], it["key"]]]) else: stack
+    | {"stack": next_stack, "out": add(acc["out"], [set(it, "path", map(stack, fn(s): s[1];))])};
+  )["out"]
+end
+
+# Builds a nested dict from items with paths: the items whose path is exactly
+# `depth` deep are leaves, and the longer paths are grouped by the section
+# name at `depth`.
+def _indent_nest(items, depth, spec):
+  let leaves = filter(items, fn(it): len(it["path"]) == depth && !it["section"];)
+  | let children = filter(items, fn(it): len(it["path"]) > depth;)
+  | let names = uniq(map(children, fn(it): it["path"][depth];))
+  | let base = dict(map(leaves, fn(it): [_row_key(spec, it["key"]), it["value"]];))
+  | fold(names, base, fn(acc, name): set(acc, _row_key(spec, name), _indent_nest(filter(children, fn(it): it["path"][depth] == name;), depth + 1, spec));)
+end
+
+# Reads an indented listing (`Section:` headers with `Key: value` lines under
+# them) into nested dicts. Indentation only has to be deeper for children.
+def _spec_indent(spec, fields, output):
+  let sep = if (has(spec, "separator")): spec["separator"] else: ":"
+  | let unquote = has(spec, "unquote") && spec["unquote"]
+  | let items = _indent_paths(_indent_sections(map(_spec_lines(spec, output), fn(line): _indent_item(line, sep, unquote);)))
+  | _indent_nest(items, 0, spec)
+end
+
+
+
+def _spec_columns(spec, fields, output):
+  let lines = _spec_lines(spec, output)
+  | if (is_empty(lines)): []
+    else:
+      do
+        let with_header = !(has(spec, "header") && spec["header"] == false)
+        | let names = if (has(spec, "headers")): spec["headers"] elif (with_header): add(if (has(spec, "prefix_headers")): spec["prefix_headers"] else: [], map(split(trim(first(lines)), "\\s+"), _key)) else: []
+        | let body = if (with_header): slice(lines, 1, len(lines)) else: lines
+        | map(body, fn(line): _apply_fields(_zip_dict(names, _split_n(trim(line), len(names))), fields, _keep_empty(spec, true));)
+      end
+end
+
+def _spec_aligned(spec, fields, output):
+  let lines = _spec_lines(spec, output)
+  | if (is_empty(lines)): []
+    else:
+      do
+        let dashes = has(spec, "offsets") && spec["offsets"] == "dashes"
+        | let header = first(lines)
+        | let starts = if (dashes): _dash_starts(lines[1]) else: _column_starts(header)
+        | let raw = _cut_at(header, starts)
+        | let names = if (has(spec, "keys") && spec["keys"] == "raw"): raw else: map(raw, _key)
+        | let body = if (dashes): slice(lines, 2, len(lines)) else: slice(lines, 1, len(lines))
+        | map(body, fn(line): _apply_fields(_zip_dict(names, _cut_at(line, starts)), fields, _keep_empty(spec, true));)
+      end
+end
+
+def _spec_delimited(spec, fields, output):
+  let lines = _spec_lines(spec, output)
+  | if (is_empty(lines)): []
+    else:
+      do
+        let sep = if (has(spec, "separator")): spec["separator"] else: "\\t"
+        | let names = map(split(first(lines), sep), fn(name): _key(trim(name));)
+        | map(slice(lines, 1, len(lines)), fn(line): _apply_fields(_zip_dict(names, map(split(line, sep), trim)), fields, _keep_empty(spec, true));)
+      end
+end
+
+def _spec_kv(spec, fields, output):
+  let sep = if (has(spec, "separator")): spec["separator"] else: ":"
+  | let unquote = has(spec, "unquote") && spec["unquote"]
+  | let shape = fn(d): _apply_fields(if (unquote): dict(map(entries(d), fn(kv): [kv[0], _unquote(kv[1])];)) else: d, fields, _keep_empty(spec, true));
+  | if (has(spec, "blocks") && spec["blocks"]): map(kv_blocks_parse(join(filter(split(_spec_text(spec, output), "\n"), fn(line): !_skipped(spec, line);), "\n"), sep), shape)
+    else: shape(kv_parse(join(_spec_lines(spec, output), "\n"), sep))
+end
+
+def _spec_tree(spec, fields, output):
+  let rows = filter(map(_spec_lines(spec, output), fn(line): capture(line, spec["pattern"]);), fn(m): !is_empty(keys(m));)
+  | let base = if (has(spec, "base")): spec["base"] else: 1
+  | let with_depth = map(rows, fn(m): set(m, "depth", base + trunc(len(m["indent"]) / spec["unit"]));)
+  | let paths = if (has(spec, "path") && spec["path"]): fold(with_depth, {"stack": [], "out": []}, fn(acc, m):
+        let stack = add(slice(acc["stack"], 0, m["depth"] - base), [m["name"]])
+        | {"stack": stack, "out": add(acc["out"], [set(m, "path", join(stack, "/"))])};
+      )["out"] else: with_depth
+  | map(paths, fn(m): _apply_fields(dict(filter(entries(m), fn(kv): kv[0] != "indent";)), fields, _keep_empty(spec, false));)
+end
+
+# Reads one line of words as a dict: the first word (after an optional type
+# word) is `first`, a word in `keys` takes the next word as its value, and any
+# other word is collected in the `flags` array.
+def _words_row(tokens, spec):
+  let types = if (has(spec, "prefix_types")): spec["prefix_types"] else: []
+  | let typed = contains(types, tokens[0]) && len(tokens) > 1
+  | let head = if (typed): tokens[1] else: tokens[0]
+  | let rest = slice(tokens, if (typed): 2 else: 1, len(tokens))
+  | let st = fold(rest, {"d": set({}, spec["first"], head), "key": None, "flags": []}, fn(acc, t):
+      if (!is_none(acc["key"])): {"d": set(acc["d"], acc["key"], t), "key": None, "flags": acc["flags"]}
+      elif (contains(spec["keys"], t)): {"d": acc["d"], "key": t, "flags": acc["flags"]}
+      else: {"d": acc["d"], "key": None, "flags": add(acc["flags"], [t])};
+    )
+  | let with_type = if (typed): set(st["d"], "type", tokens[0]) else: st["d"]
+  | if (is_empty(st["flags"])): with_type else: set(with_type, "flags", st["flags"])
+end
+
+def _spec_words(spec, fields, output):
+  map(_spec_lines(spec, output), fn(line): _apply_fields(_words_row(split(trim(line), "\\s+"), spec), fields, true);)
+end
+
+def _spec_lines_type(spec, output):
+  map(_spec_lines(spec, output), trim)
+end
+
+# Runs a spec against the output.
+def _run_spec(spec, fields, output):
+  let kind = spec["type"]
+  | if (kind == "regex"): _spec_regex(spec, fields, output)
+    elif (kind == "columns"): _spec_columns(spec, fields, output)
+    elif (kind == "aligned"): _spec_aligned(spec, fields, output)
+    elif (kind == "delimited"): _spec_delimited(spec, fields, output)
+    elif (kind == "kv"): _spec_kv(spec, fields, output)
+    elif (kind == "tree"): _spec_tree(spec, fields, output)
+    elif (kind == "record"): _spec_record(spec, fields, output)
+    elif (kind == "blocks"): _spec_blocks(spec, fields, output)
+    elif (kind == "words"): _spec_words(spec, fields, output)
+    elif (kind == "lines"): _spec_lines_type(spec, output)
+    elif (kind == "choice"): _spec_choice(spec, fields, output)
+    elif (kind == "indent"): _spec_indent(spec, fields, output)
+    else: error("cmd: unknown spec type `" + kind + "`")
+end
+
+# Runs a registry entry's parser: its spec, or its function.
+def _run_entry(entry, output):
+  let parse = entry["parse"]
+  | if (is_dict(parse)): _run_spec(parse, if (has(entry, "fields")): entry["fields"] else: {}, output)
+    else: parse(output)
+end
+
+# Parses the output with the registry entry for `key`, without checking its
+# signature. The public `*_parse` functions of migrated parsers call this.
+def _by_key(key, output):
+  let entry = _find(key)
+  | if (is_none(entry)): error("cmd: no parser for `" + key + "`") else: _run_entry(entry, output)
+end
+
+# Parser table. Each entry has a `key`, a `sig` regex (multi-line mode,
+# matched against the first 20 lines) that says what the text must look
+# like, and the `parse` function. A `sig` of None means the format is too
+# generic to claim: such an entry is never picked by `detect`, and is used
+# only when named.
+def _registry():
+  [
+    {"key": "ps", "sig": "\\A\\s*(?:USER\\s+PID|UID\\s+PID|PID\\s+(?:TTY|TT)\\s)", "parse": {"type": "columns"}, "fields": {"pid": {"type": "int"}, "ppid": {"type": "int"}, "cpu_percent": {"type": "int"}, "mem_percent": {"type": "int"}, "vsz": {"type": "int"}, "rss": {"type": "int"}}},
+    {"key": "df", "sig": "\\A(?:df: [^\\n]*\\n)*Filesystem\\s+", "parse": {"type": "columns", "replace": [["Mounted on", "Mounted_on"]]}, "fields": {"filesystem": {"type": "string"}, "mounted_on": {"type": "string"}, "*": {"type": "int"}}},
+    {"key": "du", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<size>[^\\t]*)\\t(?<path>.*)$"]}, "fields": {"size": {"type": "int"}}},
+    {"key": "ls", "sig": "\\A(?:total \\d+\\n)?(?:[-dlbcps][-rwxsStT]{9}[@+.]?\\s+\\d+\\s+\\S+\\s+\\S+\\s+\\d+\\s+\\w{3}\\s+\\d{1,2}\\s+(?:\\d{2}:\\d{2}|\\d{4})\\s+[^\\n]+\\n)*[-dlbcps][-rwxsStT]{9}[@+.]?\\s+\\d+\\s+\\S+\\s+\\S+\\s+\\d+\\s+\\w{3}\\s+\\d{1,2}\\s+(?:\\d{2}:\\d{2}|\\d{4})\\s+[^\\n]+\\n*\\z", "parse": {"type": "regex", "patterns": ["^(?<permissions>[l]\\S{9,10})\\s+(?<links>\\d+)\\s+(?<owner>\\S+)\\s+(?<group>\\S+)\\s+(?<size>\\d+)\\s+(?<modified>\\w{3}\\s+\\d{1,2}\\s+(?:\\d{2}:\\d{2}|\\d{4}))\\s+(?<name>.*?) -> (?<link_target>.*)$", "^(?<permissions>[-dlbcps]\\S{9,10})\\s+(?<links>\\d+)\\s+(?<owner>\\S+)\\s+(?<group>\\S+)\\s+(?<size>\\d+)\\s+(?<modified>\\w{3}\\s+\\d{1,2}\\s+(?:\\d{2}:\\d{2}|\\d{4}))\\s+(?<name>.*)$"]}, "fields": {"links": {"type": "int"}, "size": {"type": "int"}, "modified": {"squeeze": true}, "type": {"derive": {"op": "prefix", "from": "permissions", "map": {"d": "directory", "l": "symlink", "-": "file"}, "default": "other"}}}},
+    {"key": "id", "sig": "\\A\\s*uid=\\d+(?:\\([^)\\n]*\\))? gid=\\d+[^\\n]*\\n*\\z", "parse": {"type": "record", "require": ["uid", "gid"], "captures": [{"re": "\\buid=(?<uid>\\d+)(?:\\((?<user>[^)]*)\\))?"}, {"re": "\\bgid=(?<gid>\\d+)(?:\\((?<group>[^)]*)\\))?"}, {"within": "\\bgroups=(?<value>\\S+)", "re": "(?<id>\\d+)(?:\\((?<name>[^)]*)\\))?", "all": true, "into": "groups", "fields": {"id": {"type": "int"}}}]}, "fields": {"uid": {"type": "int"}, "gid": {"type": "int"}}},
+    {"key": "wc", "sig": None, "parse": {"type": "regex", "patterns": ["^\\s*(?<lines>\\d+)\\s+(?<words>\\d+)\\s+(?<bytes>\\d+)(?:\\s+(?<file>.*))?$"]}, "fields": {"lines": {"type": "int"}, "words": {"type": "int"}, "bytes": {"type": "int"}}},
+    {"key": "ping", "sig": "packets transmitted, \\d+ (?:packets )?received", "parse": {"type": "record", "require": ["transmitted", "loss_percent"], "patterns": ["(?<transmitted>\\d+) packets transmitted, (?<received>\\d+) (?:packets )?received", "(?<loss_percent>[\\d.]+)% packet loss", "= (?<rtt_min>[\\d.]+)/(?<rtt_avg>[\\d.]+)/(?<rtt_max>[\\d.]+)/(?<rtt_stddev>[\\d.]+) ms"]}, "fields": {"*": {"type": "float"}}},
+    {"key": "lsof", "sig": "\\A\\s*COMMAND\\s+PID\\s+(?:TID\\s+TASKCMD\\s+)?USER", "parse": {"type": "columns"}, "fields": {"pid": {"type": "int"}}},
+    {"key": "free", "sig": "\\A\\s+total\\s+used\\s+free", "parse": {"type": "columns", "prefix_headers": ["type"], "keep_empty": false}, "fields": {"type": {"remove": ":"}, "*": {"type": "int"}}},
+    {"key": "top", "sig": "^\\s*PID\\s+(?:COMMAND|USER)\\s+[^\\n]*%CPU", "parse": {"type": "columns", "start_at": "^\\s*PID\\s+"}, "fields": {"pid": {"type": "int"}, "cpu_percent": {"type": "int"}, "mem_percent": {"type": "int"}}},
+    {"key": "uptime", "sig": "\\A\\s*\\d{1,2}:\\d{2}(?::\\d{2})?\\s+up\\s+[^\\n]*load averages?:[^\\n]*\\n*\\z", "parse": {"type": "regex", "single": true, "patterns": ["(?<time>\\d{1,2}:\\d{2}(?::\\d{2})?)\\s+up\\s+(?<uptime>.*?),\\s+(?<users>\\d+) users?,\\s+load averages?:\\s+(?<load_1>[\\d.]+),?\\s+(?<load_5>[\\d.]+),?\\s+(?<load_15>[\\d.]+)"]}, "fields": {"users": {"type": "int"}, "load_1": {"type": "float"}, "load_5": {"type": "float"}, "load_15": {"type": "float"}}},
+    {"key": "who", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<user>\\S+)\\s+(?<tty>\\S+)\\s+(?<login>.+?)(?:\\s+\\((?<host>[^)]*)\\))?$"], "trim": true}},
+    {"key": "w", "sig": "\\A[^\\n]*\\bup\\b[^\\n]*\\nUSER\\s+TTY\\s+(?:FROM\\s+)?LOGIN@", "parse": {"type": "columns", "start_at": "^USER\\s+TTY"}},
+    {"key": "mount", "sig": _shape("\\S[^\\n]* on [^\\n]+? (?:type \\S+ )?\\([^\\n]*\\)"), "parse": {"type": "regex", "patterns": ["^(?<device>.+?) on (?<mount_point>.+?) type (?<type>\\S+) \\((?<options>.*)\\)$", "^(?<device>.+?) on (?<mount_point>.+?) \\((?<type>[^,)]+)(?:, (?<options>.*))?\\)$"]}, "fields": {"options": {"type": "array", "default": []}}},
+    {"key": "uname", "sig": "\\A(?:Darwin|Linux|FreeBSD|OpenBSD|NetBSD|SunOS|CYGWIN\\S*|MINGW\\S*) \\S+ \\S+ [^\\n]+\\n*\\z", "parse": {"type": "regex", "single": true, "trim": true, "patterns": ["^(?<kernel_name>\\S+) (?<node_name>\\S+) (?<kernel_release>\\S+) (?<kernel_version>.+) (?<machine>\\S+) \\S+ \\S+ GNU/Linux$", "^(?<kernel_name>\\S+) (?<node_name>\\S+) (?<kernel_release>\\S+) (?<kernel_version>.+) (?<machine>\\S+)$"]}},
+    {"key": "sysctl", "sig": None, "parse": {"type": "regex", "as": "map", "patterns": ["^(?<key>[^:=\\s]+)\\s*[:=]\\s*(?<value>.*)$"]}},
+    {"key": "vm_stat", "sig": "\\AMach Virtual Memory Statistics", "parse": {"type": "regex", "as": "map", "normalize_keys": true, "patterns": [{"re": "page size of (?<value>\\d+) bytes", "set": {"key": "page_size"}}, "^\"?(?<key>[^\":]+)\"?:\\s+(?<value>\\d+)\\.?$"]}, "fields": {"*": {"type": "int"}}},
+    {"key": "vmstat", "sig": "^\\s*r\\s+b\\s+(?:swpd|avm)", "parse": {"type": "columns", "start_at": "^\\s*r\\s+b\\s"}, "fields": {"*": {"type": "int"}}},
+    {"key": "launchctl", "sig": "\\APID\\tStatus\\tLabel", "parse": {"type": "columns"}, "fields": {"pid": {"type": "int", "null_if": ["-"]}, "status": {"type": "int"}}},
+    {"key": "ifconfig", "sig": "\\A\\S+: flags=\\d+<", "parse": {"type": "blocks", "start": "^\\S", "require": ["name"], "captures": [{"re": "^(?<name>[^:\\s]+):?\\s+flags=\\d+<(?<flags>[^>]*)>\\s+mtu\\s+(?<mtu>\\d+)"}, {"re": "ether (?<ether>\\S+)"}, {"re": "status: (?<status>\\w+)"}, {"re": "inet (?<address>\\S+) netmask (?<netmask>\\S+)", "all": true, "into": "ipv4"}, {"re": "inet6 (?<address>\\S+) prefixlen (?<prefixlen>\\d+)", "all": true, "into": "ipv6", "fields": {"prefixlen": {"type": "int"}}}]}, "fields": {"flags": {"type": "array", "split": ","}, "mtu": {"type": "int"}}},
+    {"key": "netstat", "sig": "^(?:tcp|udp)[46]?\\S*\\s+\\d+\\s+\\d+\\s+\\S+\\s+\\S+", "parse": {"type": "regex", "patterns": ["^(?<proto>(?:tcp|udp|raw|icmp)\\S*)\\s+(?<recv_q>\\d+)\\s+(?<send_q>\\d+)\\s+(?<local_address>\\S+)\\s+(?<foreign_address>\\S+)(?:\\s+(?<state>[A-Z][A-Z_0-9]+)(?:\\s+(?<program>.*))?|\\s+.*)?$"], "trim": true}, "fields": {"recv_q": {"type": "int"}, "send_q": {"type": "int"}}},
+    {"key": "ss", "sig": "\\A(?:Netid\\s+State|State\\s+Recv-Q\\s+Send-Q)", "parse": {"type": "regex", "patterns": ["^(?<netid>tcp|udp|raw|icmp\\S*|u_\\S+|p_\\S+|nl)\\s+(?<state>[A-Z][A-Z0-9-]+)\\s+(?<recv_q>\\d+)\\s+(?<send_q>\\d+)\\s+(?<local_address>\\S+)\\s+(?<peer_address>\\S+)(?:\\s+(?<process>.*))?$", "^(?<state>[A-Z][A-Z0-9-]+)\\s+(?<recv_q>\\d+)\\s+(?<send_q>\\d+)\\s+(?<local_address>\\S+)\\s+(?<peer_address>\\S+)(?:\\s+(?<process>.*))?$"], "trim": true}, "fields": {"recv_q": {"type": "int"}, "send_q": {"type": "int"}}},
+    {"key": "arp", "sig": _shape("\\S+ \\(\\d+\\.\\d+\\.\\d+\\.\\d+\\) at [^\\n]+"), "parse": {"type": "regex", "patterns": ["^(?<host>\\S+) \\((?<ip>[^)]+)\\) at (?<mac>\\S+)(?: on (?<interface>\\S+))?"]}},
+    {"key": "ip addr", "sig": "\\A\\d+: \\S+: <[^>]*> mtu \\d+|" + _shape("\\S+\\s+(?:UP|DOWN|UNKNOWN|LOWERLAYERDOWN|DORMANT|NOTPRESENT|TESTING)(?:\\s[^\\n]*)?"), "parse": {"type": "choice", "options": [{"when": "\\A\\d+: ", "parse": {"type": "blocks", "start": "^\\d+: ", "require": ["name"], "captures": [{"re": "^(?<index>\\d+): (?<name>[^:@\\s]+)(?:@\\S+)?: <(?<flags>[^>]*)> mtu (?<mtu>\\d+).*? state (?<state>\\S+)"}, {"re": "link/\\S+ (?<mac>[0-9a-f:]{17})"}, {"re": "inet (?<value>\\S+)", "all": true, "values": true, "into": "ipv4"}, {"re": "inet6 (?<value>\\S+)", "all": true, "values": true, "into": "ipv6"}]}, "fields": {"index": {"type": "int"}, "flags": {"type": "array", "split": ","}, "mtu": {"type": "int"}}}, {"parse": {"type": "regex", "trim": true, "patterns": ["^(?<name>\\S+)\\s+(?<state>\\S+)(?:\\s+(?<addresses>.*))?$"]}, "fields": {"addresses": {"type": "array", "split": "\\s+", "default": []}}}]}},
+    {"key": "ip route", "sig": None, "parse": {"type": "words", "first": "destination", "prefix_types": ["unicast", "local", "broadcast", "multicast", "blackhole", "unreachable", "prohibit", "throw", "nat"], "keys": ["via", "dev", "proto", "scope", "src", "metric", "table", "mtu", "weight", "expires", "pref", "initcwnd", "advmss", "hoplimit", "rtt"]}, "fields": {"*": {"type": "int"}}},
+    {"key": "mdls", "sig": "\\AkMDItem\\w+\\s+=", "parse": {"type": "kv", "separator": "=", "unquote": true}, "fields": {"*": {"null_if": ["(null)"]}}},
+    {"key": "otool", "sig": "^\\s+\\S[^\\n]* \\(compatibility version [\\d.]+, current version", "parse": {"type": "regex", "patterns": ["^\\s+(?<path>\\S.*?) \\(compatibility version (?<compatibility_version>[\\d.]+), current version (?<current_version>[\\d.]+)\\)"]}},
+    {"key": "unzip", "sig": "^\\s*Length\\s+Date\\s+Time\\s+Name", "parse": {"type": "regex", "patterns": ["^\\s*(?<size>\\d+)\\s+(?<date>\\S+)\\s+(?<time>\\d{2}:\\d{2})\\s+(?<name>.*)$"]}, "fields": {"size": {"type": "int"}}},
+    {"key": "tar", "sig": None, "parse": {"type": "choice", "options": [{"when": "^[-dlbcps][-rwxsStT]{9} \\S+\\s+\\d+ \\d{4}-\\d{2}-\\d{2}", "parse": {"type": "regex", "patterns": ["^(?<permissions>[-dlbcps][-rwxsStT]{9}) (?<owner>\\S+)\\s+(?<size>\\d+) (?<modified>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}(?::\\d{2})?) (?<name>.*)$"]}, "fields": {"size": {"type": "int"}}}, {"parse": {"type": "regex", "patterns": ["^(?<permissions>[l]\\S{9,10})\\s+(?<links>\\d+)\\s+(?<owner>\\S+)\\s+(?<group>\\S+)\\s+(?<size>\\d+)\\s+(?<modified>\\w{3}\\s+\\d{1,2}\\s+(?:\\d{2}:\\d{2}|\\d{4}))\\s+(?<name>.*?) -> (?<link_target>.*)$", "^(?<permissions>[-dlbcps]\\S{9,10})\\s+(?<links>\\d+)\\s+(?<owner>\\S+)\\s+(?<group>\\S+)\\s+(?<size>\\d+)\\s+(?<modified>\\w{3}\\s+\\d{1,2}\\s+(?:\\d{2}:\\d{2}|\\d{4}))\\s+(?<name>.*)$"]}, "fields": {"links": {"type": "int"}, "size": {"type": "int"}, "modified": {"squeeze": true}, "type": {"derive": {"op": "prefix", "from": "permissions", "map": {"d": "directory", "l": "symlink", "-": "file"}, "default": "other"}}}}]}},
+    {"key": "grep", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<file>[^:]+):(?<line>\\d+):(?<text>.*)$", "^(?<file>[^:]+):(?<text>.*)$"]}, "fields": {"line": {"type": "int"}, "text": {"keep_empty": true}}},
+    {"key": "file", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<path>.+?): (?<description>.*)$"]}},
+    {"key": "checksum", "sig": _shape("(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{56}|[0-9a-f]{64}|[0-9a-f]{96}|[0-9a-f]{128}) [ *][^\\n]+|(?:MD5|SHA\\d+) \\([^\\n]*\\) = [0-9a-f]+"), "parse": {"type": "regex", "patterns": ["^(?<algorithm>[A-Za-z0-9-]+) \\((?<file>.*)\\) = (?<hash>[0-9a-fA-F]+)$", "^(?<hash>[0-9a-fA-F]{32,128}) [ *](?<file>.*)$"]}},
+    {"key": "pgrep", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<pid>\\d+)(?: (?<name>.*))?$"], "trim": true}, "fields": {"pid": {"type": "int"}}},
+    {"key": "uniq", "sig": None, "parse": {"type": "regex", "patterns": ["^\\s*(?<count>\\d+) (?<value>.*)$"]}, "fields": {"count": {"type": "int"}}},
+    {"key": "lines", "sig": None, "parse": {"type": "lines"}},
+    {"key": "lsblk", "sig": "\\ANAME\\s+(?:MAJ:MIN|FSTYPE|RM\\b)|\\ANAME\\b[^\\n]*\\bMOUNTPOINTS?\\b", "parse": {"type": "columns", "strip": "^[├└│─ ]+"}, "fields": {"rm": {"type": "int"}, "ro": {"type": "int"}}},
+    {"key": "blkid", "sig": _shape("/[^:\\n]+: [^\\n]*\\w+=\"[^\"\\n]*\"[^\\n]*"), "parse": {"type": "blocks", "start": "^\\S", "require": ["device"], "captures": [{"re": "^(?<device>[^:]+):"}, {"re": "(?<key>\\w+)=\"(?<value>[^\"]*)\"", "all": true, "merge": true}]}},
+    {"key": "lsmod", "sig": "\\AModule\\s+Size\\s+Used by", "parse": {"type": "columns", "headers": ["module", "size", "used", "used_by"]}, "fields": {"size": {"type": "int"}, "used": {"type": "int"}}},
+    {"key": "lspci", "sig": _shape("(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\\.\\d [^:\\n]+: [^\\n]+"), "parse": {"type": "regex", "patterns": ["^(?<slot>\\S+) (?<class>[^:]+): (?<description>.*)$"]}},
+    {"key": "lsusb", "sig": _shape("Bus \\d{3} Device \\d{3}: ID [0-9a-f]{4}:[0-9a-f]{4}(?: [^\\n]*)?"), "parse": {"type": "regex", "patterns": ["^Bus (?<bus>\\d+) Device (?<device>\\d+): ID (?<id>[0-9a-f]{4}:[0-9a-f]{4})(?: (?<description>.*))?$"]}},
+    {"key": "dmesg", "sig": _shape("\\[\\s*\\d+\\.\\d+\\] [^\\n]*|\\[[A-Za-z]{3} [A-Za-z]{3}\\s+\\d+ [\\d:]+ \\d{4}\\] [^\\n]*"), "parse": {"type": "regex", "patterns": ["^\\[\\s*(?<time>[\\d.]+)\\] (?<message>.*)$", "^\\[(?<time>[A-Za-z]{3} [A-Za-z]{3}\\s+\\d+ [\\d:]+ \\d{4})\\] (?<message>.*)$"]}, "fields": {"time": {"type": "float"}}},
+    {"key": "syslog", "sig": _shape("(?:\\w{3}\\s+\\d+ \\d\\d:\\d\\d:\\d\\d|\\d{4}-\\d{2}-\\d{2}T\\S+) \\S+ [^\\s\\[:]+(?:\\[\\d+\\])?: [^\\n]*"), "parse": {"type": "regex", "patterns": ["^(?<timestamp>\\w{3}\\s+\\d+\\s+[\\d:]+|\\d{4}-\\d{2}-\\d{2}T\\S+)\\s+(?<host>\\S+)\\s+(?<process>[^\\[:\\s]+)(?:\\[(?<pid>\\d+)\\])?:\\s+(?<message>.*)$"]}, "fields": {"pid": {"type": "int"}}},
+    {"key": "systemctl", "sig": "\\A\\s*UNIT(?: FILE)?\\s+(?:LOAD|STATE)", "parse": {"type": "columns", "replace": [["(?m)^[●○×*]\\s+", "  "], ["UNIT FILE", "UNIT_FILE"]], "until_blank": true}},
+    {"key": "ldd", "sig": _shape("[ \\t]*\\S+ (?:=> \\S+ )?\\(0x[0-9a-f]+\\)|[ \\t]*\\S+ => not found"), "parse": {"type": "regex", "patterns": ["^\\s*(?<name>\\S+) => (?<path>\\S+) \\((?<address>0x[0-9a-f]+)\\)$", {"re": "^\\s*(?<name>\\S+) => not found$", "set": {"path": None}}, "^\\s*(?<path>\\S+) \\((?<address>0x[0-9a-f]+)\\)$"]}, "fields": {"name": {"derive": {"op": "basename", "from": "path"}}}},
+    {"key": "traceroute", "sig": "^\\s*\\d+\\s+\\S+(?: \\([0-9a-f.:]+\\))?\\s+[\\d.]+ ms", "parse": traceroute_parse},
+    {"key": "dig", "sig": "^;; ANSWER SECTION:|^\\S+\\s+\\d+\\s+IN\\s+\\S+\\s+[^\\n]+", "parse": {"type": "regex", "patterns": ["^(?<name>[^;\\s]\\S*)\\s+(?<ttl>\\d+)\\s+(?<class>IN|CH|HS)\\s+(?<type>\\S+)\\s+(?<data>.*)$"]}, "fields": {"ttl": {"type": "int"}}},
+    {"key": "curl", "sig": "\\AHTTP/\\d", "parse": {"type": "blocks", "start": "^HTTP/", "last": true, "replace": [["\\r", ""]], "require": ["status"], "captures": [{"re": "^HTTP/(?<http_version>\\S+) (?<status>\\d{3})(?: (?<reason>.*))?"}, {"re": "(?m)^(?<key>[^:\\s]+):\\s*(?<value>.*)$", "all": true, "merge": true, "into": "headers"}]}, "fields": {"status": {"type": "int"}}},
+    {"key": "ssh-keygen", "sig": _shape("\\d+ (?:SHA256|MD5):\\S+ [^\\n]* \\([A-Z0-9-]+\\)"), "parse": {"type": "regex", "patterns": ["^(?<bits>\\d+) (?<fingerprint>\\S+) (?<comment>.*) \\((?<type>[^)]+)\\)$"]}, "fields": {"bits": {"type": "int"}}},
+    {"key": "passwd", "sig": _shape("#[^\\n]*|[^:\\s#][^:\\n]*:[^:\\n]*:\\d+:\\d+:[^:\\n]*:[^:\\n]*:[^:\\n]*"), "parse": {"type": "regex", "patterns": ["^(?<user>[^:]*):(?<password>[^:]*):(?<uid>\\d+):(?<gid>\\d+):(?<comment>[^:]*):(?<home>[^:]*):(?<shell>.*)$"], "skip": ["^#"], "keep_empty": true}, "fields": {"uid": {"type": "int"}, "gid": {"type": "int"}}},
+    {"key": "group", "sig": _shape("#[^\\n]*|[^:\\s#][^:\\n]*:[^:\\n]*:\\d+:[^:\\n]*"), "parse": {"type": "regex", "patterns": ["^(?<name>[^:]*):(?<password>[^:]*):(?<gid>\\d+):(?<members>.*)$"], "skip": ["^#"], "keep_empty": true}, "fields": {"gid": {"type": "int"}, "members": {"type": "array", "split": ","}}},
+    {"key": "hosts", "sig": None, "parse": {"type": "regex", "trim": true, "replace": [["(?m)#.*$", ""]], "patterns": ["^(?<ip>\\S+)\\s+(?<hostname>\\S+)(?:\\s+(?<aliases>.*))?$"]}, "fields": {"aliases": {"type": "array", "split": "\\s+", "default": []}}},
+    {"key": "os-release", "sig": "^(?:PRETTY_NAME|VERSION_ID)=", "parse": {"type": "kv", "separator": "=", "unquote": true, "skip": ["^\\s*#"]}},
+    {"key": "locale", "sig": None, "parse": {"type": "kv", "separator": "=", "unquote": true, "skip": ["^\\s*#"]}},
+    {"key": "time", "sig": "\\Areal\\s+\\S+\\s*\\n(?:user|sys)\\s+", "parse": time_parse},
+    {"key": "env", "sig": None, "parse": {"type": "kv", "separator": "="}},
+    {"key": "sw_vers", "sig": "\\AProductName:\\s+", "parse": {"type": "kv", "separator": ":"}},
+    {"key": "lscpu", "sig": "\\AArchitecture:\\s+\\S+", "parse": {"type": "kv", "separator": ":"}},
+    {"key": "hostnamectl", "sig": "^\\s*Static hostname:", "parse": {"type": "kv", "separator": ":"}},
+    {"key": "timedatectl", "sig": "^\\s+Local time:", "parse": {"type": "kv", "separator": ":"}},
+    {"key": "git log", "sig": "\\Acommit [0-9a-f]{7,64}", "parse": {"type": "blocks", "start": "^commit ", "require": ["commit"], "captures": [{"re": "^commit (?<commit>[0-9a-f]+)(?: \\((?<refs>[^)]*)\\))?"}, {"re": "(?m)^Author: (?<author>.*)$"}, {"re": "(?m)^Date:\\s+(?<date>.*)$"}, {"re": "(?m)^Merge: (?<merge>.*)$"}, {"re": "(?m)^ {4}(?<value>.*)$", "all": true, "values": true, "into": "message", "join": "\n", "trim": true}]}},
+    {"key": "git log --oneline", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<commit>[0-9a-f]{7,40})(?: \\((?<refs>[^)]*)\\))? (?<message>.*)$"]}},
+    {"key": "git status", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<index>.)(?<worktree>.) (?<orig_path>.+?) -> (?<path>.+)$", "^(?<index>.)(?<worktree>.) (?<path>.+)$"], "skip": ["^## "], "keep_empty": true}},
+    {"key": "git branch", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<mark>[*+ ]) (?<name>\\S+)\\s+(?<commit>[0-9a-f]{7,40})\\s+(?<message>.*)$", "^(?<mark>[*+ ]) (?<name>.+?)\\s*$"]}, "fields": {"mark": {"type": "bool", "true_values": ["*"], "false_values": [" ", "+"], "rename": "current"}}},
+    {"key": "git diff --numstat", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<added>\\d+|-)\\t(?<deleted>\\d+|-)\\t(?<path>.*)$"]}, "fields": {"added": {"type": "int", "null_if": ["-"]}, "deleted": {"type": "int", "null_if": ["-"]}}},
+    {"key": "git diff --stat", "sig": "^ \\d+ files? changed", "parse": git_diff_stat_parse},
+    {"key": "git shortlog", "sig": None, "parse": {"type": "regex", "patterns": ["^\\s*(?<commits>\\d+)\\s+(?<author>.*?)(?: <(?<email>[^>]*)>)?$"]}, "fields": {"commits": {"type": "int"}}},
+    {"key": "git remote", "sig": _shape("\\S+\\s+\\S+ \\((?:fetch|push)\\)"), "parse": {"type": "regex", "patterns": ["^(?<name>\\S+)\\s+(?<url>\\S+) \\((?<direction>fetch|push)\\)$"]}},
+    {"key": "git stash", "sig": _shape("stash@\\{\\d+\\}: [^\\n]*"), "parse": {"type": "regex", "patterns": ["^(?<ref>stash@\\{(?<index>\\d+)\\}): (?:WIP on|On) (?<branch>[^:]+): (?<message>.*)$", "^(?<ref>stash@\\{(?<index>\\d+)\\}): (?<message>.*)$"]}, "fields": {"index": {"type": "int"}}},
+    {"key": "git reflog", "sig": _shape("[0-9a-f]{7,40} (?:\\([^)\\n]*\\) )?\\S+@\\{\\d+\\}: [^\\n]*"), "parse": {"type": "regex", "patterns": ["^(?<commit>[0-9a-f]{7,40}) (?:\\([^)]*\\) )?(?<ref>\\S+@\\{\\d+\\}): (?<action>[^:]+)(?:: (?<message>.*))?$"]}},
+    {"key": "git worktree", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<path>.+?)\\s+(?<commit>[0-9a-f]{7,40})\\s+(?:\\[(?<branch>[^\\]]+)\\]|\\((?<state>[^)]+)\\))"]}},
+    {"key": "git config", "sig": None, "parse": {"type": "kv", "separator": "="}},
+    {"key": "pip list", "sig": "\\A\\s*Package\\s+Version", "parse": {"type": "aligned", "offsets": "dashes"}},
+    {"key": "pip freeze", "sig": _shape("[A-Za-z0-9_.-]+(?:==\\S+| @ \\S+)"), "parse": {"type": "regex", "patterns": ["^(?<name>[^=@\\s]+)(?:==(?<version>\\S+)| @ (?<url>\\S+))$"]}},
+    {"key": "pip show", "sig": "\\AName: [^\\n]+\\nVersion: ", "parse": {"type": "kv", "blocks": true, "replace": [["\\n---\\n", "\n\n"]]}},
+    {"key": "brew list", "sig": None, "parse": {"type": "regex", "trim": true, "patterns": ["^(?<name>\\S+)(?:\\s+(?<versions>.*))?$"]}, "fields": {"versions": {"type": "array", "split": "\\s+", "default": []}}},
+    {"key": "brew outdated", "sig": None, "parse": {"type": "regex", "trim": true, "patterns": ["^(?<name>\\S+) \\((?<installed_versions>[^)]*)\\)(?: != | < )(?<current_version>\\S+)$", "^(?<name>\\S+)$"]}, "fields": {"installed_versions": {"type": "array", "split": ",\\s*"}}},
+    {"key": "brew services", "sig": "\\AName\\s+Status\\s+User\\s+File", "parse": {"type": "columns"}},
+    {"key": "gem list", "sig": _shape("\\*\\*\\* LOCAL GEMS \\*\\*\\*|\\S+ \\((?:default: )?\\d[^)\\n]*\\)"), "parse": {"type": "regex", "patterns": ["^(?<name>\\S+) \\((?<versions>.*)\\)$"]}, "fields": {"versions": {"type": "array"}}},
+    {"key": "cargo install", "sig": "\\A\\S+ v\\d[^:\\s]*(?: \\([^)\\n]*\\))?:\\n", "parse": {"type": "blocks", "start": "^\\S", "require": ["name"], "captures": [{"re": "^(?<name>\\S+) v(?<version>[^\\s:]+)(?: \\((?<source>[^)]*)\\))?:"}, {"re": "(?m)^\\s+(?<value>\\S.*)$", "all": true, "values": true, "into": "binaries"}]}},
+    {"key": "npm ls", "sig": "^[├└][─┬]+ \\S+@\\S+", "parse": {"type": "tree", "pattern": "^(?<indent>[│ ]*)[├└][─┬]+ (?<name>@?[^@\\s]+)@(?<version>\\S+)", "unit": 2}},
+    {"key": "dpkg", "sig": "^\\|\\|/ Name\\s+Version", "parse": {"type": "regex", "patterns": ["^(?<status>[a-zA-Z]{2,3})\\s+(?<name>\\S+)\\s+(?<version>\\S+)\\s+(?<architecture>\\S+)\\s+(?<description>.*)$"]}},
+    {"key": "apt list", "sig": _shape("Listing\\.\\.\\.[^\\n]*|[a-z0-9][a-z0-9+.-]*/[a-z0-9,.-]+ \\d\\S* [a-z0-9]+(?: \\[[^\\]\\n]*\\])?"), "parse": {"type": "regex", "patterns": ["^(?<name>[^/\\s]+)/(?<suite>\\S+) (?<version>\\S+) (?<architecture>\\S+)(?: \\[(?<status>[^\\]]*)\\])?$"]}},
+    {"key": "dnf list", "sig": "^(?:Installed|Available) Packages", "parse": {"type": "regex", "patterns": ["^(?<name>\\S+)\\.(?<architecture>[A-Za-z0-9_]+)\\s+(?<version>\\S+)\\s+(?<repo>\\S+)$"], "trim": true}},
+    {"key": "pacman", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<name>\\S+)\\s+(?<version>\\S+)$"], "trim": true}},
+    {"key": "conda list", "sig": "^# Name\\s+Version\\s+Build", "parse": {"type": "columns", "skip": ["^\\s*#"], "header": false, "headers": ["name", "version", "build", "channel"]}},
+    {"key": "snap list", "sig": "\\AName\\s+Version\\s+Rev\\s+Tracking", "parse": {"type": "columns"}, "fields": {"rev": {"type": "int"}}},
+    {"key": "helm list", "sig": "\\ANAME\\tNAMESPACE\\tREVISION", "parse": {"type": "delimited"}, "fields": {"revision": {"type": "int"}}},
+    {"key": "docker ps", "sig": "\\ACONTAINER ID\\s+IMAGE\\s+COMMAND", "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "docker images", "sig": "\\AREPOSITORY\\s+TAG\\s+IMAGE ID", "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "docker stats", "sig": "\\ACONTAINER ID\\s+NAME\\s+CPU %", "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "docker volume", "sig": "\\ADRIVER\\s+VOLUME NAME", "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "docker network", "sig": "\\ANETWORK ID\\s+NAME\\s+DRIVER", "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "kubectl get", "sig": "\\A(?:NAMESPACE\\s+)?NAME\\s+(?:READY|TYPE\\s+CLUSTER-IP|STATUS|DESIRED|CLUSTER-IP|CAPACITY)\\s+", "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "kubectl top", "sig": "\\A(?:NAMESPACE\\s+)?NAME\\s+CPU\\(cores\\)", "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "date", "sig": "\\A\\w{3} \\w{3}\\s+\\d{1,2} \\d{2}:\\d{2}:\\d{2} \\S+ \\d{4}\\n*\\z", "parse": {"type": "regex", "single": true, "patterns": ["^(?<weekday>\\w{3}) (?<month>\\w{3})\\s+(?<day>\\d{1,2}) (?<time>\\d{2}:\\d{2}:\\d{2}) (?<timezone>\\S+) (?<year>\\d{4})$"], "trim": true}, "fields": {"day": {"type": "int"}, "year": {"type": "int"}}},
+    {"key": "hostname", "sig": None, "parse": {"type": "regex", "single": true, "trim": true, "patterns": ["^(?<hostname>.+)$"]}},
+    {"key": "whoami", "sig": None, "parse": {"type": "regex", "single": true, "trim": true, "patterns": ["^(?<user>.+)$"]}},
+    {"key": "stat", "sig": "\\A\\s+File: |" + _shape("\\d+ \\d+ \\S+ \\d+ \\S+ \\S+ \\d+ \\d+ \"[^\"]*\" \"[^\"]*\" \"[^\"]*\" \"[^\"]*\" \\d+ \\d+ \\S+ [^\\n]*"), "parse": {"type": "choice", "options": [{"when": "\\A\\s+File: ", "parse": {"type": "blocks", "start": "^\\s+File: ", "require": ["file"], "captures": [{"re": "File: (?<file>[^\\n]+)"}, {"re": "Size: (?<size>\\d+)\\s+Blocks: (?<blocks>\\d+)\\s+IO Block: (?<io_block>\\d+)\\s+(?<type>[^\\n]+)"}, {"re": "Device: (?<device>\\S+)\\s+Inode: (?<inode>\\d+)\\s+Links: (?<links>\\d+)"}, {"re": "Access: \\((?<mode>\\d+)/(?<permissions>\\S+)\\)\\s+Uid: \\(\\s*(?<uid>\\d+)/\\s*(?<user>\\S+)\\)\\s+Gid: \\(\\s*(?<gid>\\d+)/\\s*(?<group>\\S+)\\)"}, {"re": "Access: (?<access>\\d{4}-[^\\n]+)"}, {"re": "Modify: (?<modify>[^\\n]+)"}, {"re": "Change: (?<change>[^\\n]+)"}, {"re": "Birth: (?<birth>\\d[^\\n]*)"}]}, "fields": {"size": {"type": "int"}, "blocks": {"type": "int"}, "io_block": {"type": "int"}, "inode": {"type": "int"}, "links": {"type": "int"}, "uid": {"type": "int"}, "gid": {"type": "int"}, "type": {"trim": true}}}, {"parse": {"type": "regex", "patterns": ["^(?<device>\\d+) (?<inode>\\d+) (?<mode>\\S+) (?<links>\\d+) (?<owner>\\S+) (?<group>\\S+) (?<rdev>\\d+) (?<size>\\d+) \"(?<atime>[^\"]*)\" \"(?<mtime>[^\"]*)\" \"(?<ctime>[^\"]*)\" \"(?<birthtime>[^\"]*)\" (?<blksize>\\d+) (?<blocks>\\d+) (?<flags>\\S+) (?<path>.*)$"]}, "fields": {"device": {"type": "int"}, "inode": {"type": "int"}, "links": {"type": "int"}, "rdev": {"type": "int"}, "size": {"type": "int"}, "blksize": {"type": "int"}, "blocks": {"type": "int"}}}]}},
+    {"key": "last", "sig": _shape(_last_line_re()), "parse": {"type": "regex", "patterns": ["^(?<user>\\S+)\\s+(?<tty>\\S+)\\s+(?:(?<host>\\S.*?)\\s+)?(?<login>[A-Z][a-z]{2} [A-Z][a-z]{2}\\s+\\d{1,2} \\d{2}:\\d{2}(?::\\d{2})?(?: \\d{4})?)(?:\\s+(?<session>.*))?$"], "skip": ["^(?:wtmp|btmp) begins"]}},
+    {"key": "route", "sig": "^Destination\\s+Gateway\\s+Genmask\\s+Flags\\s+Metric", "parse": {"type": "columns", "start_at": "^Destination\\s+Gateway"}, "fields": {"metric": {"type": "int"}, "ref": {"type": "int"}, "use": {"type": "int"}}},
+    {"key": "route get", "sig": "\\A\\s*route to:", "parse": {"type": "kv", "separator": ":"}},
+    {"key": "zipinfo", "sig": "\\AArchive:[^\\n]*\\nZip file size:", "parse": {"type": "regex", "patterns": ["^(?<permissions>[-dlrwxsStT]{10})\\s+(?<version>[\\d.]+)\\s+(?<os>\\S+)\\s+(?<size>\\d+)\\s+(?<flags>\\S+)\\s+(?<method>\\S+)\\s+(?<date>\\S+)\\s+(?<time>\\d{2}:\\d{2})\\s+(?<name>.*)$"]}, "fields": {"size": {"type": "int"}}},
+    {"key": "gzip", "sig": "\\A\\s*compressed\\s+uncompressed\\s+ratio", "parse": {"type": "columns"}, "fields": {"compressed": {"type": "int"}, "uncompressed": {"type": "int"}}},
+    {"key": "hexdump", "sig": _shape("[0-9a-f]{8}(?:  (?:[0-9a-f]{2} ?)+ +\\|[^\\n]*\\|)?|\\*"), "parse": {"type": "regex", "patterns": ["^(?<offset>[0-9a-f]{8})\\s+(?<bytes>(?:[0-9a-f]{2} ?)+)\\s+\\|(?<ascii>.*)\\|$"]}, "fields": {"bytes": {"remove": " "}, "ascii": {"keep_empty": true}}},
+    {"key": "cksum", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<checksum>\\d+)\\s+(?<size>\\d+)(?:\\s+(?<file>.*))?$"], "trim": true}, "fields": {"checksum": {"type": "int"}, "size": {"type": "int"}}},
+    {"key": "tree", "sig": "^\\d+ director(?:y|ies)(?:, \\d+ files?)?$", "parse": {"type": "tree", "pattern": "^(?<indent>(?:│   |    )*)[├└]── (?<name>.*)$", "unit": 4, "path": true}},
+    {"key": "getconf", "sig": None, "parse": {"type": "regex", "as": "map", "trim": true, "patterns": ["^(?<key>[A-Za-z_0-9]+):?\\s*(?<value>.*)$"]}, "fields": {"*": {"type": "int"}}},
+    {"key": "diskutil list", "sig": "\\A/dev/disk\\d+ \\(", "parse": {"type": "blocks", "start": "^/dev/", "require": ["device"], "captures": [{"re": "^(?<device>/dev/\\S+) \\((?<description>[^)]*)\\):"}, {"re": "(?m)^[ \\t]+(?<index>\\d+):[ \\t]+(?<type>\\S+)[ \\t]+(?<name>.*?)[ \\t]+(?<size>\\*?[\\d.]+ [KMGTP]?B)[ \\t]+(?<identifier>disk\\S+)$", "all": true, "into": "partitions", "keep_empty": true, "fields": {"index": {"type": "int"}}}]}},
+    {"key": "diskutil info", "sig": "^\\s+Device Identifier:", "parse": {"type": "kv", "separator": ":"}},
+    {"key": "pmset batt", "sig": "\\ANow drawing from '", "parse": {"type": "record", "require": ["source"], "captures": [{"re": "Now drawing from '(?<source>[^']*)'"}, {"re": "(?m)^[ \\t]*-(?<name>\\S+) \\(id=(?<id>\\d+)\\)[ \\t]+(?<percent>\\d+)%; (?<state>[^;]+)(?:; (?<remaining>[^;]*?))? present: (?<present>\\w+)$", "all": true, "into": "batteries", "fields": {"id": {"type": "int"}, "percent": {"type": "int"}, "state": {"trim": true}, "present": {"type": "bool", "true_values": ["true"], "false_values": ["false"]}}}]}},
+    {"key": "csrutil", "sig": "\\ASystem Integrity Protection status:", "parse": {"type": "regex", "single": true, "patterns": ["status: (?<status>enabled|disabled)"]}},
+    {"key": "spctl", "sig": "\\Aassessments (?:enabled|disabled)", "parse": {"type": "regex", "single": true, "patterns": ["assessments (?<assessments>enabled|disabled)"]}},
+    {"key": "networksetup -listallhardwareports", "sig": "\\A\\s*Hardware Port:", "parse": {"type": "kv", "blocks": true}},
+    {"key": "memory_pressure", "sig": "\\AThe system has \\d+ \\(\\d+ pages with a page size of \\d+\\)", "parse": {"type": "record", "captures": [{"re": "The system has (?<memory_bytes>\\d+) \\((?<pages>\\d+) pages with a page size of (?<page_size>\\d+)\\)"}, {"re": "(?m)^[ \\t]*(?<key>[A-Za-z][^:\\n]*):[ \\t]*(?<value>[\\d.]+)%?[ \\t]*$", "all": true, "merge": true}]}, "fields": {"*": {"type": "int"}}},
+    {"key": "lsattr", "sig": _shape("-[-a-zA-Z]{15,31} [^\\n]+"), "parse": {"type": "regex", "patterns": ["^(?<attributes>[-a-zA-Z]{8,32}) (?<path>.+)$"]}},
+    {"key": "findmnt", "sig": "\\ATARGET\\s+SOURCE\\s+FSTYPE", "parse": {"type": "columns", "strip": "^[├└│─ ]+"}},
+    {"key": "swapon", "sig": "\\ANAME\\s+TYPE\\s+SIZE\\s+USED\\s+PRIO", "parse": {"type": "columns"}, "fields": {"prio": {"type": "int"}}},
+    {"key": "getfacl", "sig": "\\A# file: ", "parse": {"type": "blocks", "start": "^# file: ", "require": ["file"], "captures": [{"re": "# file: (?<file>[^\\n]+)"}, {"re": "# owner: (?<owner>[^\\n]+)"}, {"re": "# group: (?<group>[^\\n]+)"}, {"re": "(?m)^(?<value>[^#\\s][^\\n]*)$", "all": true, "values": true, "into": "entries"}]}},
+    {"key": "getcap", "sig": _shape("\\S+\\s+(?:=\\s+)?cap_\\S[^\\n]*"), "parse": {"type": "regex", "patterns": ["^(?<path>\\S+)\\s+(?:=\\s+)?(?<capabilities>cap_\\S.*)$"], "trim": true}},
+    {"key": "host", "sig": _shape("\\S+ (?:has address \\S+|has IPv6 address \\S+|is an alias for \\S+|mail is handled by \\d+ \\S+|descriptive text \"[^\\n]*\"|name server \\S+|domain name pointer \\S+)"), "parse": {"type": "regex", "patterns": [{"re": "^(?<name>\\S+) has address (?<value>\\S+)$", "set": {"type": "A"}}, {"re": "^(?<name>\\S+) has IPv6 address (?<value>\\S+)$", "set": {"type": "AAAA"}}, {"re": "^(?<name>\\S+) is an alias for (?<value>\\S+)$", "set": {"type": "CNAME"}}, {"re": "^(?<name>\\S+) mail is handled by (?<priority>\\d+) (?<value>\\S+)$", "set": {"type": "MX"}}, {"re": "^(?<name>\\S+) descriptive text \"(?<value>.*)\"$", "set": {"type": "TXT"}}, {"re": "^(?<name>\\S+) name server (?<value>\\S+)$", "set": {"type": "NS"}}, {"re": "^(?<name>\\S+) domain name pointer (?<value>\\S+)$", "set": {"type": "PTR"}}], "trim": true}, "fields": {"priority": {"type": "int"}}},
+    {"key": "nslookup", "sig": "\\AServer:\\s+\\S", "parse": {"type": "record", "require": ["server"], "captures": [{"re": "Server:\\s+(?<server>\\S+)"}, {"re": "Address:\\s+(?<server_address>\\S+)"}, {"into": "answers", "blocks": {"type": "blocks", "start": "^Name:", "require": ["name"], "captures": [{"re": "^Name:\\s+(?<name>\\S+)"}, {"re": "(?m)^Address:\\s+(?<value>\\S+)", "all": true, "values": true, "into": "addresses"}]}}]}},
+    {"key": "nmcli connection", "sig": "\\ANAME\\s+UUID\\s+TYPE\\s+DEVICE", "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "nmcli device", "sig": "\\ADEVICE\\s+TYPE\\s+STATE", "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "loginctl list-sessions", "sig": "\\A\\s*SESSION\\s+UID\\s+USER", "parse": {"type": "columns", "until_blank": true}, "fields": {"uid": {"type": "int"}}},
+    {"key": "loginctl list-users", "sig": "\\A\\s*UID\\s+USER\\s+LINGER", "parse": {"type": "columns", "until_blank": true}, "fields": {"uid": {"type": "int"}}},
+    {"key": "localectl", "sig": "\\A\\s*System Locale:", "parse": {"type": "kv", "separator": ":"}},
+    {"key": "lsb_release", "sig": "\\A(?:No LSB modules are available\\.\\n)?Distributor ID:", "parse": {"type": "kv", "separator": ":"}},
+    {"key": "lsns", "sig": "\\A\\s*NS\\s+TYPE\\s+NPROCS", "parse": {"type": "columns"}, "fields": {"nprocs": {"type": "int"}, "pid": {"type": "int"}}},
+    {"key": "lslocks", "sig": "\\ACOMMAND\\s+PID\\s+TYPE\\s+SIZE\\s+MODE", "parse": {"type": "columns"}, "fields": {"pid": {"type": "int"}}},
+    {"key": "lsmem", "sig": "\\A\\s*RANGE\\s+SIZE\\s+STATE", "parse": {"type": "columns", "until_blank": true}},
+    {"key": "lslogins", "sig": "\\A\\s*UID\\s+USER\\s+PROC", "parse": {"type": "columns"}, "fields": {"uid": {"type": "int"}, "proc": {"type": "int"}}},
+    {"key": "rpm", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<name>.+)-(?<version>[^-]+)-(?<release>[^-]+)\\.(?<arch>[A-Za-z0-9_]+)$"], "trim": true}},
+    {"key": "apt-cache madison", "sig": _shape("\\s*\\S+\\s+\\|\\s+\\S+\\s+\\|\\s+[^\\n]+"), "parse": {"type": "regex", "patterns": ["^(?<package>\\S+)\\s+\\|\\s+(?<version>\\S+)\\s+\\|\\s+(?<source>.*)$"], "trim": true}},
+    {"key": "apt-cache search", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<package>\\S+) - (?<description>.*)$"]}},
+    {"key": "dpkg status", "sig": "\\APackage: \\S+\\n", "parse": {"type": "kv", "blocks": true, "skip": ["^[ \\t]"]}},
+    {"key": "ulimit", "sig": _shape("[^\\n]+? \\((?:[^,)\\n]+, )?-\\w\\) +\\S+"), "parse": {"type": "regex", "patterns": ["^(?<name>.+?)\\s+\\((?:(?<unit>[^,)]+), )?(?<flag>-\\w)\\)\\s+(?<value>\\S+)$"]}, "fields": {"value": {"type": "int"}}},
+    {"key": "pdfinfo", "sig": "^PDF version:\\s+", "parse": {"type": "kv", "separator": ":"}},
+    {"key": "exiftool", "sig": None, "parse": {"type": "kv", "separator": ":"}},
+    {"key": "chage", "sig": "\\ALast password change\\s*:", "parse": {"type": "kv", "separator": ":"}},
+    {"key": "apt-config dump", "sig": _shape("[A-Za-z0-9:_-]+ \"[^\"\\n]*\";"), "parse": {"type": "regex", "keep_empty": true, "patterns": ["^(?<key>[A-Za-z0-9:_-]+) \"(?<value>[^\"]*)\";$"]}},
+    {"key": "debconf-show", "sig": _shape("[* ] \\S+/\\S+: [^\\n]*"), "parse": {"type": "regex", "keep_empty": true, "patterns": ["^(?<seen>[* ]) (?<name>\\S+): (?<value>.*)$"]}, "fields": {"seen": {"type": "bool", "true_values": ["*"], "false_values": [" "]}}},
+    {"key": "getent hosts", "sig": None, "parse": {"type": "regex", "trim": true, "patterns": ["^(?<ip>\\S+)\\s+(?<hostname>\\S+)(?:\\s+(?<aliases>.*))?$"]}, "fields": {"aliases": {"type": "array", "split": "\\s+", "default": []}}},
+    {"key": "uuidparse", "sig": "\\A\\s*UUID\\s+VARIANT\\s+TYPE\\s+TIME", "parse": {"type": "columns"}},
+    {"key": "nstat", "sig": "\\A#kernel\\n", "parse": {"type": "regex", "skip": ["^#"], "patterns": ["^(?<name>\\S+)\\s+(?<value>\\d+)\\s+(?<rate>[\\d.]+)$"]}, "fields": {"value": {"type": "int"}, "rate": {"type": "float"}}},
+    {"key": "systemd-path", "sig": None, "parse": {"type": "kv", "separator": ":"}},
+    {"key": "ionice", "sig": "\\A(?:none|realtime|best-effort|idle)(?:: prio \\d+)?\\n*\\z", "parse": {"type": "regex", "single": true, "patterns": ["^(?<class>none|realtime|best-effort|idle)(?:: prio (?<priority>\\d+))?$"]}, "fields": {"priority": {"type": "int"}}},
+    {"key": "pmap", "sig": "^[0-9a-f]{8,16}\\s+\\d+K\\s+[-rwxsp]{4,5}\\s", "parse": {"type": "regex", "trim": true, "patterns": ["^(?<address>[0-9a-f]{8,16})\\s+(?<size_kb>\\d+)K\\s+(?<permissions>[-rwxsp]{4,5})\\s+(?<mapping>.*)$"]}, "fields": {"size_kb": {"type": "int"}}},
+    {"key": "bluetoothctl show", "sig": "\\A\\s*Controller [0-9A-F]{2}(?::[0-9A-F]{2}){5}", "parse": {"type": "kv", "separator": ":", "skip": ["^\\s*Controller "]}},
+    {"key": "system_profiler", "sig": "\\A[A-Z][^\\n:]*:\\n\\n {4}\\S[^\\n]*:\\n\\n {6}\\S", "parse": {"type": "indent"}},
+    {"key": "ip neighbour", "sig": _shape("\\S+ dev \\S+(?: lladdr \\S+)?(?: (?:router|proxy|extern_learn|offload))* (?:INCOMPLETE|REACHABLE|STALE|DELAY|PROBE|FAILED|NOARP|PERMANENT)"), "parse": {"type": "words", "first": "address", "keys": ["dev", "lladdr", "proto", "protocol"]}},
+    {"key": "netstat routes", "sig": "\\A(?:Routing tables|Kernel IP routing table\\nDestination\\s+Gateway\\s+Genmask\\s+Flags\\s+MSS)", "parse": {"type": "choice", "options": [{"when": "\\ARouting tables", "parse": {"type": "blocks", "start": "^Internet6?:", "skip": ["^Destination[ \\t]+Gateway"], "require": ["family"], "captures": [{"re": "^(?<family>Internet6?):"}, {"re": "(?m)^(?<destination>\\S+)[ \\t]+(?<gateway>\\S+)[ \\t]+(?<flags>\\S+)[ \\t]+(?<netif>\\S+)(?:[ \\t]+(?<expire>\\S+))?[ \\t]*$", "all": true, "into": "routes"}]}}, {"parse": {"type": "columns", "start_at": "^Destination\\s+Gateway"}, "fields": {"mss": {"type": "int"}, "window": {"type": "int"}, "irtt": {"type": "int"}}}]}},
+    {"key": "networksetup -listnetworkserviceorder", "sig": "\\A(?:An asterisk[^\\n]*\\n)?\\((?:\\d+|\\*)\\) ", "parse": {"type": "blocks", "start": "^\\((?:\\d+|\\*)\\) ", "require": ["service"], "captures": [{"re": "(?m)^\\((?<order>\\d+|\\*)\\) (?<service>.*)$"}, {"re": "Hardware Port: (?<hardware_port>[^,]+), Device: (?<device>[^)]*)"}]}, "fields": {"order": {"type": "int"}}},
+    {"key": "networksetup -getinfo", "sig": "\\A(?:DHCP|Manual|BOOTP|Manually Using DHCP Router) Configuration\\n", "parse": {"type": "kv", "separator": ":"}},
+    {"key": "xxd", "sig": _shape("[0-9a-f]{8}: [0-9a-f ]{39}  [^\\n]*"), "parse": {"type": "regex", "patterns": ["^(?<offset>[0-9a-f]{8}): (?<bytes>[0-9a-f ]{39})  (?<ascii>.*)$"]}, "fields": {"bytes": {"remove": " "}, "ascii": {"keep_empty": true}}},
+    {"key": "lipo", "sig": "\\A(?:Architectures in the fat file: [^\\n]* are: [^\\n]*|Non-fat file: [^\\n]* is architecture: [^\\n]*)\\n*\\z", "parse": {"type": "regex", "single": true, "trim": true, "patterns": ["^Architectures in the fat file: (?<file>.*) are: (?<architectures>.*)$", "^Non-fat file: (?<file>.*) is architecture: (?<architectures>.*)$"]}, "fields": {"architectures": {"type": "array", "split": "\\s+"}}},
+    {"key": "pmset", "sig": "\\ASystem-wide power settings:\\n", "parse": {"type": "regex", "as": "map", "normalize_keys": true, "patterns": ["^[ \\t]+(?<key>.*?[A-Za-z])[ \\t]+(?<value>(?:-?\\d+|/\\S+)(?:[ \\t].*)?)$"]}, "fields": {"*": {"type": "int"}}},
+    {"key": "nvram", "sig": None, "parse": {"type": "regex", "as": "map", "patterns": ["^(?<key>[^\\t]+)\\t(?<value>.*)$"]}},
+    {"key": "dscacheutil", "sig": "\\Aname: [^\\n]+\\npassword: ", "parse": {"type": "kv", "blocks": true, "separator": ":"}, "fields": {"uid": {"type": "int"}, "gid": {"type": "int"}}},
+    {"key": "plutil", "sig": "\\A[{\\[]\\n[ ]+\\S[^\\n]* => ", "parse": {"type": "indent", "separator": " => ", "unquote": true, "skip": ["^[{\\[]$", "^\\s*[}\\]],?$"]}},
+    {"key": "ethtool", "sig": "\\Adriver: \\S+\\nversion: [^\\n]*\\n", "parse": {"type": "kv", "separator": ":"}},
+    {"key": "lscpu extended", "sig": "\\A\\s*CPU\\s+NODE\\s+SOCKET\\s+CORE", "parse": {"type": "columns"}, "fields": {"cpu": {"type": "int"}, "node": {"type": "int"}, "socket": {"type": "int"}, "core": {"type": "int"}}},
+    {"key": "networkctl list", "sig": "\\A\\s*IDX\\s+LINK\\s+TYPE\\s+OPERATIONAL", "parse": {"type": "columns", "until_blank": true}, "fields": {"idx": {"type": "int"}}},
+    {"key": "busctl list", "sig": "\\ANAME\\s+PID\\s+PROCESS\\s+USER\\s+CONNECTION", "parse": {"type": "columns"}},
+    {"key": "systemctl show", "sig": None, "parse": {"type": "kv", "separator": "="}},
+    {"key": "loginctl show-session", "sig": None, "parse": {"type": "kv", "separator": "="}},
+    {"key": "loginctl show-user", "sig": None, "parse": {"type": "kv", "separator": "="}},
+    {"key": "systemctl list-sockets", "sig": "\\A\\s*LISTEN\\s+UNIT\\s+ACTIVATES", "parse": {"type": "columns", "until_blank": true}},
+    {"key": "systemctl list-jobs", "sig": "\\A\\s*JOB\\s+UNIT\\s+TYPE\\s+STATE", "parse": {"type": "columns", "until_blank": true}, "fields": {"job": {"type": "int"}}},
+    {"key": "resolvectl status", "sig": "\\A(?:Global|Link \\d+ \\([^)\\n]+\\))\\n", "parse": {"type": "blocks", "start": "^(?:Global|Link \\d+)", "require": ["name"], "captures": [{"re": "^(?<name>Global|Link \\d+(?: \\([^)]*\\))?)"}, {"re": "(?m)^[ \\t]*(?<key>[A-Za-z][^:\\n]*?):[ \\t]*(?<value>\\S.*)$", "all": true, "merge": true}]}},
+    {"key": "systemd-analyze blame", "sig": _shape("\\s*(?:[\\d.]+(?:h|min|s|ms|us|d) ?)+\\s+\\S+\\.(?:service|mount|target|socket|timer|device|path|slice|scope|swap|automount)"), "parse": {"type": "regex", "trim": true, "patterns": ["^(?<time>(?:[\\d.]+(?:h|min|s|ms|us|d) ?)+?)\\s+(?<unit>\\S+)$"]}},
+    {"key": "fdisk", "sig": "\\ADisk /dev/\\S+: [^\\n]*, \\d+ bytes, \\d+ sectors", "parse": {"type": "blocks", "start": "^Disk /dev/", "require": ["device"], "captures": [{"re": "^Disk (?<device>/dev/\\S+): (?<size>[^,]+), (?<bytes>\\d+) bytes, (?<sectors>\\d+) sectors"}, {"re": "(?m)^Disk model: (?<model>.*?)[ \\t]*$"}, {"re": "(?m)^Disklabel type: (?<label_type>\\S+)"}, {"re": "(?m)^Disk identifier: (?<identifier>\\S+)"}, {"re": "(?m)^(?<device>/dev/\\S+)[ \\t]+(?:(?<boot>\\*)[ \\t]+)?(?<start>\\d+)[ \\t]+(?<end>\\d+)[ \\t]+(?<sectors>\\d+)[ \\t]+(?<size>\\S+)[ \\t]+(?<type>\\S.*?)[ \\t]*$", "all": true, "into": "partitions", "fields": {"start": {"type": "int"}, "end": {"type": "int"}, "sectors": {"type": "int"}}}]}, "fields": {"bytes": {"type": "int"}, "sectors": {"type": "int"}}}
+  ]
+end
+
+# Command names that share a parser with another command.
+def _name_aliases():
+  {
+    "pip3": "pip", "yum": "dnf", "podman": "docker", "ping6": "ping", "printenv": "env", "journalctl": "syslog", "tracepath": "traceroute",
+    "md5": "checksum", "md5sum": "checksum", "shasum": "checksum", "sha1sum": "checksum", "sha224sum": "checksum", "sha256sum": "checksum", "sha384sum": "checksum", "sha512sum": "checksum", "b2sum": "checksum",
+    "sum": "cksum", "dpkg-query": "dpkg", "networkctl": "networkctl list", "busctl": "busctl list", "resolvectl": "resolvectl status", "systemd-resolve": "resolvectl status",
+    "rg": "grep", "egrep": "grep", "fgrep": "grep", "ag": "grep", "find": "lines"
+  }
+end
+
+# Subcommands that share a parser with another `command subcommand` key.
+def _key_aliases():
+  {
+    "docker container": "docker ps", "docker image": "docker images", "docker compose": "docker ps",
+    "npm list": "npm ls", "npm ll": "npm ls", "ip a": "ip addr", "ip address": "ip addr", "ip r": "ip route",
+    "getent passwd": "passwd", "getent group": "group", "apt-get list": "apt list",
+    "nmcli con": "nmcli connection", "nmcli c": "nmcli connection", "nmcli dev": "nmcli device", "nmcli d": "nmcli device",
+    "localectl status": "localectl", "lsb_release a": "lsb_release",
+    "ip neigh": "ip neighbour", "ip neighbor": "ip neighbour", "ip n": "ip neighbour"
+  }
+end
+
+# Returns the registry entry for a key or an alias, or None.
+def _find(key):
+  let names = _name_aliases()
+  | let subs = _key_aliases()
+  | let resolved = if (has(subs, key)): subs[key] elif (has(names, key)): names[key] else: key
+  | let hits = filter(_registry(), fn(entry): entry["key"] == resolved;)
+  | if (is_empty(hits)): None else: hits[0]
+end
+
+# Returns the first non-flag argument, skipping the value of the flags in
+# `value_flags` (for example `git -C path` or `kubectl -n namespace`).
+def _subcommand(args, value_flags):
+  let st = fold(args, {"skip": false, "sub": None}, fn(acc, a):
+    if (!is_none(acc["sub"])): acc
+    elif (acc["skip"]): {"skip": false, "sub": None}
+    elif (contains(value_flags, a)): {"skip": true, "sub": None}
+    elif (starts_with(a, "-")): acc
+    else: {"skip": false, "sub": a};
+  )
+  | if (is_none(st["sub"])): "" else: st["sub"]
+end
+
+# Returns the parser key for a command, e.g. "git log" or "ps". Tries
+# `name subcommand` (with the git `--oneline`, `--numstat` and `--stat`
+# variants), then `name`, and falls back to the subcommand key so the error
+# names what was asked for.
+def _parser_key(cmd, args):
+  let base = basename(cmd)
+  | let name = if (base == "pip3"): "pip" elif (base == "yum"): "dnf" elif (base == "podman"): "docker" elif (base == "dpkg-query"): "dpkg" else: base
+  | let value_flags = if (name == "git"): ["-C", "-c"] elif (name == "kubectl"): ["-n", "--namespace", "--context"] else: []
+  | let sub = _subcommand(args, value_flags)
+  | let with_sub = name + " " + sub
+  | let variant = if (with_sub == "git log" && contains(args, "--oneline")): "git log --oneline" elif (with_sub == "git diff" && contains(args, "--numstat")): "git diff --numstat" elif (with_sub == "git diff" && contains(args, "--stat")): "git diff --stat" elif (name == "dpkg" && (contains(args, "-s") || contains(args, "--status"))): "dpkg status" elif (name == "netstat" && (contains(args, "-r") || contains(args, "-rn") || contains(args, "-nr") || contains(args, "--route"))): "netstat routes" elif (name == "lscpu" && (contains(args, "-e") || contains(args, "--extended"))): "lscpu extended" elif (name == "networksetup" && !is_empty(args)): "networksetup " + args[0] else: with_sub
+  | if (variant != with_sub && !is_none(_find(variant))): variant
+    elif (sub != "" && !is_none(_find(variant))): variant
+    elif (!is_none(_find(name))): name
+    elif (sub != ""): variant
+    else: name
+end
+
+# Returns the first 20 lines of the text, the window signatures are matched against.
+def _window(output):
+  join(slice(split(output, "\n"), 0, 20), "\n")
+end
+
+# Returns true when the signature matches the text. The signature is a claim
+# about the whole text (anchored with `\A` and `\z`) or about a line in it.
+def _fits(output, sig):
+  is_regex_match(_window(output), "(?m)" + sig)
+end
+
+# Parses the output of a command with the parser registered for `key`, such
+# as "ps", "df", "id", "ping", "git log", "git diff --stat", "pip list",
+# "docker ps", "kubectl get", "ip addr" or "ss". See the README for the
+# full list. Raises an error for an unknown key.
+#
+# Naming a parser is a claim about the text, not a way past the checks: when
+# the parser has a signature the text must fit it, otherwise an error lists
+# what `detect` finds. Blank output parses to an empty result. Call the
+# parser function itself (for example `ps_parse`) to skip the check.
+#
+# Example:
+# ```
+# import "cmd" | cmd::parse_output("du", "8\t./src")
+# #=> [{"size": 8, "path": "./src"}]
+# ```
+#
+# Returns: array or dict
+def parse_output(key, output):
+  let entry = _find(key)
+  | if (is_none(entry)): error("cmd: no parser for `" + key + "`, use columns_parse, table_parse or kv_parse")
+    elif (!is_none(entry["sig"]) && trim(output) != "" && !_fits(output, entry["sig"])): error("cmd: the text does not look like `" + entry["key"] + "` output (" + (if (is_empty(detect(output))): "detect finds no match" else: "detect finds: " + join(detect(output), ", ")) + "). Call the parser function directly to skip this check")
+    else:
+      _run_entry(entry, output)
+end
+
+# Returns the keys of the parsers whose signature fits the first 20 lines of
+# the output, or an empty array when none does. Formats that are too generic
+# to recognize (`wc`, `du`, `git status`, ...) have no signature and are
+# never returned.
+#
+# Example:
+# ```
+# import "cmd" | cmd::detect("uid=501(alice) gid=20(staff)")
+# #=> ["id"]
+# ```
+#
+# Returns: array
+def detect(output):
+  filter(_registry(), fn(entry): !is_none(entry["sig"]) && _fits(output, entry["sig"]);)
+  | map(fn(entry): entry["key"];)
+end
+
+# Detects the command from the output text and parses it.
+# Raises an error when no signature fits or when several do, listing the
+# candidates. Use `parse_output` with a key to name the parser explicitly.
+#
+# Example:
+# ```
+# import "cmd" | cmd::parse_auto("uid=501(alice) gid=20(staff)")
+# #=> {"uid": 501, "user": "alice", "gid": 20, "group": "staff"}
+# ```
+#
+# Returns: array or dict
+def parse_auto(output):
+  let candidates = detect(output)
+  | if (len(candidates) == 1): parse_output(candidates[0], output)
+    elif (is_empty(candidates)): error("cmd: could not detect the command, name a parser with parse_output(key, output)")
+    else: error("cmd: ambiguous output, candidates: " + join(candidates, ", ") + ". Name a parser with parse_output(key, output)")
+end
+
+# Runs a command and parses its output with the parser for the command name
+# and subcommand (`git log`, `docker ps`, `ip addr`, ...). Requires the
+# --allow-run flag. The command is not run through a shell.
+#
+# Example:
+# ```
+# import "cmd" | cmd::run("df", ["-k"])
+# ```
+#
+# Returns: array or dict
+def run(cmd, args = []):
+  parse_output(_parser_key(cmd, args), system(cmd, args))
+end

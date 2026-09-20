@@ -1,0 +1,1129 @@
+include "test"
+| include "cmd"
+|
+
+def test_columns_parse_basic():
+  let result = columns_parse("PID CMD\n1 init\n2 sh")
+  | assert_eq(result, [{"PID": "1", "CMD": "init"}, {"PID": "2", "CMD": "sh"}])
+end
+
+def test_columns_parse_last_column_keeps_spaces():
+  let result = columns_parse("PID CMD\n1 python  -m   http.server")
+  | assert_eq(result[0]["CMD"], "python  -m   http.server")
+end
+
+def test_columns_parse_custom_headers():
+  let result = columns_parse("ignored header\n1 2", ["a", "b"])
+  | assert_eq(result, [{"a": "1", "b": "2"}])
+end
+
+def test_columns_parse_missing_value_is_empty():
+  let result = columns_parse("A B\n1")
+  | assert_eq(result, [{"A": "1", "B": ""}])
+end
+
+def test_columns_parse_empty_input():
+  assert_eq(columns_parse(""), [])
+end
+
+def test_table_parse_values_with_spaces():
+  let result = table_parse("CONTAINER ID   IMAGE     STATUS\nabc123         nginx     Up 2 hours\nde4567         redis     Exited (0) 3 days ago")
+  | assert_eq(len(result), 2)
+  | assert_eq(result[0], {"CONTAINER ID": "abc123", "IMAGE": "nginx", "STATUS": "Up 2 hours"})
+  | assert_eq(result[1]["STATUS"], "Exited (0) 3 days ago")
+end
+
+def test_table_parse_empty_input():
+  assert_eq(table_parse(""), [])
+end
+
+def test_kv_parse_splits_on_first_separator():
+  let result = kv_parse("Name: Alice\nTime: 12:30")
+  | assert_eq(result, {"Name": "Alice", "Time": "12:30"})
+end
+
+def test_kv_parse_env_style():
+  let result = kv_parse("A=1\nB=x=y", "=")
+  | assert_eq(result, {"A": "1", "B": "x=y"})
+end
+
+def test_kv_parse_skips_lines_without_separator():
+  let result = kv_parse("no separator\nkey: value")
+  | assert_eq(result, {"key": "value"})
+end
+
+def test_kv_blocks_parse_splits_on_blank_lines():
+  let result = kv_blocks_parse("a: 1\nb: 2\n\na: 3")
+  | assert_eq(result, [{"a": "1", "b": "2"}, {"a": "3"}])
+end
+
+def test_ps_parse_converts_numeric_fields():
+  let result = ps_parse("USER PID %CPU %MEM COMMAND\nroot 1 0.5 1.2 /sbin/init  -x")
+  | assert_eq(result, [{"user": "root", "pid": 1, "cpu_percent": 0.5, "mem_percent": 1.2, "command": "/sbin/init  -x"}])
+end
+
+def test_ps_parse_empty_input():
+  assert_eq(ps_parse(""), [])
+end
+
+def test_df_parse_linux_kilobytes():
+  let result = df_parse("Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/sda1 100 40 60 40% /")
+  | assert_eq(result, [{"filesystem": "/dev/sda1", "1k-blocks": 100, "used": 40, "available": 60, "use_percent": "40%", "mounted_on": "/"}])
+end
+
+def test_df_parse_mount_point_with_space():
+  let result = df_parse("Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/sdb1 100 40 60 40% /Volumes/My Drive")
+  | assert_eq(result[0]["mounted_on"], "/Volumes/My Drive")
+end
+
+def test_df_parse_human_readable_sizes_stay_strings():
+  let result = df_parse("Filesystem Size Used Avail Use% Mounted on\n/dev/sda1 460Gi 200Gi 260Gi 44% /")
+  | assert_eq(result[0]["size"], "460Gi")
+end
+
+def test_du_parse_numeric_size():
+  let result = du_parse("8\t./src\n16\t.")
+  | assert_eq(result, [{"size": 8, "path": "./src"}, {"size": 16, "path": "."}])
+end
+
+def test_du_parse_human_readable_size_stays_string():
+  let result = du_parse("4.0K\t./a b")
+  | assert_eq(result, [{"size": "4.0K", "path": "./a b"}])
+end
+
+def test_ls_parse_file_and_directory():
+  let result = ls_parse("total 8\n-rw-r--r--@  1 alice  staff   12 Jan  1 12:00 my file.txt\ndrwxr-xr-x   5 alice  staff  160 Dec 25  2023 src")
+  | assert_eq(len(result), 2)
+  | assert_eq(result[0], {"type": "file", "permissions": "-rw-r--r--@", "links": 1, "owner": "alice", "group": "staff", "size": 12, "modified": "Jan 1 12:00", "name": "my file.txt"})
+  | assert_eq(result[1]["type"], "directory")
+  | assert_eq(result[1]["modified"], "Dec 25 2023")
+end
+
+def test_ls_parse_symlink_target():
+  let result = ls_parse("lrwxr-xr-x   1 alice  staff    5 Jan  1 12:00 ln -> target.txt")
+  | assert_eq(result[0]["type"], "symlink")
+  | assert_eq(result[0]["name"], "ln")
+  | assert_eq(result[0]["link_target"], "target.txt")
+end
+
+def test_ls_parse_skips_non_entries():
+  assert_eq(ls_parse("total 0\nnot an entry"), [])
+end
+
+def test_git_log_parse_commits():
+  let result = git_log_parse("commit abc123 (HEAD -> main)\nAuthor: A <a@x.dev>\nDate:   Mon Jan 1 12:00:00 2024 +0000\n\n    fix bug\n    \n    more detail\n\ncommit def456\nMerge: 1 2\nAuthor: B <b@x.dev>\nDate:   Tue Jan 2 12:00:00 2024 +0000\n\n    merge\n")
+  | assert_eq(len(result), 2)
+  | assert_eq(result[0], {"commit": "abc123", "author": "A <a@x.dev>", "date": "Mon Jan 1 12:00:00 2024 +0000", "message": "fix bug\n\nmore detail", "refs": "HEAD -> main"})
+  | assert_eq(result[1]["merge"], "1 2")
+  | assert_eq(result[1]["message"], "merge")
+end
+
+def test_git_log_parse_empty_input():
+  assert_eq(git_log_parse(""), [])
+end
+
+def test_parse_output_dispatches_by_key():
+  assert_eq(parse_output("du", "8\t./src"), [{"size": 8, "path": "./src"}])
+  | assert_eq(parse_output("env", "A=1"), {"A": "1"})
+end
+
+def test_parse_output_unknown_key_raises():
+  assert_eq(try: parse_output("nope", "") catch: "error", "error")
+end
+
+def test_git_status_parse_codes_and_rename():
+  let result = git_status_parse("## main...origin/main\nR  old.txt -> new.txt\n M a.rs\n?? b.txt")
+  | assert_eq(len(result), 3)
+  | assert_eq(result[0], {"index": "R", "worktree": " ", "path": "new.txt", "orig_path": "old.txt"})
+  | assert_eq(result[1], {"index": " ", "worktree": "M", "path": "a.rs"})
+  | assert_eq(result[2], {"index": "?", "worktree": "?", "path": "b.txt"})
+end
+
+def test_git_status_parse_clean_tree():
+  assert_eq(git_status_parse(""), [])
+end
+
+def test_git_branch_parse_current_marker():
+  let result = git_branch_parse("* main\n  dev")
+  | assert_eq(result, [{"name": "main", "current": true}, {"name": "dev", "current": false}])
+end
+
+def test_git_branch_parse_verbose():
+  let result = git_branch_parse("* main 8d3580f5 fix bug\n  dev  1a2b3c4 wip")
+  | assert_eq(result[0], {"name": "main", "commit": "8d3580f5", "message": "fix bug", "current": true})
+  | assert_eq(result[1]["name"], "dev")
+end
+
+def test_git_branch_parse_detached_head():
+  let result = git_branch_parse("* (HEAD detached at abc1234)\n  main")
+  | assert_eq(result[0]["name"], "(HEAD detached at abc1234)")
+end
+
+def test_id_parse_full():
+  let result = id_parse("uid=501(alice) gid=20(staff) groups=20(staff),12(everyone)")
+  | assert_eq(result["uid"], 501)
+  | assert_eq(result["user"], "alice")
+  | assert_eq(result["group"], "staff")
+  | assert_eq(result["groups"], [{"id": 20, "name": "staff"}, {"id": 12, "name": "everyone"}])
+end
+
+def test_id_parse_without_groups():
+  let result = id_parse("uid=0(root) gid=0(root)")
+  | assert_eq(result, {"uid": 0, "user": "root", "gid": 0, "group": "root"})
+end
+
+def test_id_parse_invalid_input():
+  assert_eq(id_parse("not id output"), {})
+end
+
+def test_wc_parse_with_files_and_total():
+  let result = wc_parse("       1       3       6 a.txt\n       2       4       8 total")
+  | assert_eq(result, [{"lines": 1, "words": 3, "bytes": 6, "file": "a.txt"}, {"lines": 2, "words": 4, "bytes": 8, "file": "total"}])
+end
+
+def test_wc_parse_stdin_has_no_file():
+  assert_eq(wc_parse("       1       3       6"), [{"lines": 1, "words": 3, "bytes": 6}])
+end
+
+def test_ping_parse_macos():
+  let result = ping_parse("2 packets transmitted, 2 packets received, 0.0% packet loss\nround-trip min/avg/max/stddev = 0.6/0.9/1.1/0.2 ms")
+  | assert_eq(result, {"transmitted": 2, "received": 2, "loss_percent": 0, "rtt_min": 0.6, "rtt_avg": 0.9, "rtt_max": 1.1, "rtt_stddev": 0.2})
+end
+
+def test_ping_parse_linux():
+  let result = ping_parse("2 packets transmitted, 2 received, 0% packet loss, time 1001ms\nrtt min/avg/max/mdev = 0.031/0.040/0.049/0.009 ms")
+  | assert_eq(result["received"], 2)
+  | assert_eq(result["rtt_avg"], 0.04)
+end
+
+def test_ping_parse_total_loss_has_no_rtt():
+  let result = ping_parse("3 packets transmitted, 0 received, 100% packet loss, time 2003ms")
+  | assert_eq(result, {"transmitted": 3, "received": 0, "loss_percent": 100})
+end
+
+def test_ping_parse_without_summary():
+  assert_eq(ping_parse("ping: cannot resolve host"), {})
+end
+
+def test_lsof_parse_name_keeps_spaces():
+  let result = lsof_parse("COMMAND PID USER FD SIZE/OFF NAME\nzsh 42 alice cwd 288 /tmp/my dir")
+  | assert_eq(result, [{"command": "zsh", "pid": 42, "user": "alice", "fd": "cwd", "size_off": "288", "name": "/tmp/my dir"}])
+end
+
+def test_free_parse_drops_missing_swap_columns():
+  let result = free_parse("               total        used        free      shared  buff/cache   available\nMem:        16336000     4200000     5000000      300000     7136000    11500000\nSwap:        2097148           0     2097148")
+  | assert_eq(result[0], {"type": "Mem", "total": 16336000, "used": 4200000, "free": 5000000, "shared": 300000, "buff_cache": 7136000, "available": 11500000})
+  | assert_eq(result[1], {"type": "Swap", "total": 2097148, "used": 0, "free": 2097148})
+end
+
+def test_free_parse_human_readable_stays_string():
+  let result = free_parse("       total  used\nMem:    15Gi   4Gi")
+  | assert_eq(result[0]["total"], "15Gi")
+end
+
+def test_pip_list_parse_uses_dash_offsets():
+  let result = pip_list_parse("Package    Version Editable project location\n---------- ------- -------------------------\nmypkg      0.1.0   /home/a/mypkg\nrequests   2.31.0")
+  | assert_eq(result[0], {"package": "mypkg", "version": "0.1.0", "editable_project_location": "/home/a/mypkg"})
+  | assert_eq(result[1], {"package": "requests", "version": "2.31.0", "editable_project_location": ""})
+end
+
+def test_pip_list_parse_empty_input():
+  assert_eq(pip_list_parse(""), [])
+end
+
+def test_parse_output_dispatches_new_keys():
+  assert_eq(parse_output("wc", "1 2 3 a"), [{"lines": 1, "words": 2, "bytes": 3, "file": "a"}])
+  | assert_eq(parse_output("sw_vers", "ProductName:\tmacOS"), {"ProductName": "macOS"})
+  | assert_eq(parse_output("printenv", "A=1"), {"A": "1"})
+  | assert_eq(parse_output("docker images", "REPOSITORY   TAG      IMAGE ID\nnginx        latest   abc123"), [{"REPOSITORY": "nginx", "TAG": "latest", "IMAGE ID": "abc123"}])
+end
+
+def test_lines_parse_drops_blank_lines_and_trims():
+  assert_eq(lines_parse("a\n\n b \n"), ["a", "b"])
+end
+
+def test_uniq_c_parse():
+  assert_eq(uniq_c_parse("      2 a\n      1 b c"), [{"count": 2, "value": "a"}, {"count": 1, "value": "b c"}])
+end
+
+def test_grep_parse_with_and_without_line_numbers():
+  assert_eq(grep_parse("a.rs:12:let x = 1;"), [{"file": "a.rs", "line": 12, "text": "let x = 1;"}])
+  | assert_eq(grep_parse("a.rs:let x = 1;"), [{"file": "a.rs", "text": "let x = 1;"}])
+end
+
+def test_file_parse():
+  assert_eq(file_parse("a.txt: ASCII text\nb.png: PNG image data, 1 x 1"), [{"path": "a.txt", "description": "ASCII text"}, {"path": "b.png", "description": "PNG image data, 1 x 1"}])
+end
+
+def test_checksum_parse_gnu_and_bsd():
+  assert_eq(checksum_parse("d41d8cd98f00b204e9800998ecf8427e  empty.txt"), [{"hash": "d41d8cd98f00b204e9800998ecf8427e", "file": "empty.txt"}])
+  | assert_eq(checksum_parse("MD5 (a b.txt) = d41d8cd98f00b204e9800998ecf8427e"), [{"algorithm": "MD5", "hash": "d41d8cd98f00b204e9800998ecf8427e", "file": "a b.txt"}])
+end
+
+def test_pgrep_parse_with_and_without_names():
+  assert_eq(pgrep_parse("123 zsh\n456"), [{"pid": 123, "name": "zsh"}, {"pid": 456}])
+end
+
+def test_arp_parse():
+  assert_eq(arp_parse("? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]"), [{"host": "?", "ip": "192.168.1.1", "mac": "aa:bb:cc:dd:ee:ff", "interface": "en0"}])
+end
+
+def test_uptime_parse_macos_and_linux():
+  assert_eq(uptime_parse("14:38  up 1:54, 1 user, load averages: 3.09 3.24 5.65"), {"time": "14:38", "uptime": "1:54", "users": 1, "load_1": 3.09, "load_5": 3.24, "load_15": 5.65})
+  | assert_eq(uptime_parse(" 12:34:56 up 5 days,  3:21,  2 users,  load average: 1.23, 1.45, 1.67")["uptime"], "5 days,  3:21")
+  | assert_eq(uptime_parse("nope"), {})
+end
+
+def test_who_parse_with_host():
+  assert_eq(who_parse("alice ttys000 Sep 20 12:01 (10.0.0.5)\nbob console Sep 20 12:45"), [{"user": "alice", "tty": "ttys000", "login": "Sep 20 12:01", "host": "10.0.0.5"}, {"user": "bob", "tty": "console", "login": "Sep 20 12:45"}])
+end
+
+def test_w_parse_skips_uptime_line():
+  assert_eq(w_parse("12:34 up 1 day\nUSER TTY FROM LOGIN@ IDLE WHAT\nalice ttys000 - 09:00 1 -zsh"), [{"user": "alice", "tty": "ttys000", "from": "-", "login": "09:00", "idle": "1", "what": "-zsh"}])
+end
+
+def test_mount_parse_macos_and_linux():
+  assert_eq(mount_parse("/dev/disk3s1s1 on / (apfs, sealed, local, read-only)"), [{"device": "/dev/disk3s1s1", "mount_point": "/", "type": "apfs", "options": ["sealed", "local", "read-only"]}])
+  | assert_eq(mount_parse("sysfs on /sys type sysfs (rw,nosuid)"), [{"device": "sysfs", "mount_point": "/sys", "type": "sysfs", "options": ["rw", "nosuid"]}])
+end
+
+def test_uname_parse_macos_and_linux():
+  assert_eq(uname_parse("Darwin host.local 27.0.0 Darwin Kernel Version 27.0.0: Tue Aug 11; root:xnu-1 arm64"), {"kernel_name": "Darwin", "node_name": "host.local", "kernel_release": "27.0.0", "kernel_version": "Darwin Kernel Version 27.0.0: Tue Aug 11; root:xnu-1", "machine": "arm64"})
+  | assert_eq(uname_parse("Linux host 5.15.0 #1 SMP Mon x86_64 x86_64 x86_64 GNU/Linux"), {"kernel_name": "Linux", "node_name": "host", "kernel_release": "5.15.0", "kernel_version": "#1 SMP Mon", "machine": "x86_64"})
+end
+
+def test_sysctl_parse_both_separators():
+  assert_eq(sysctl_parse("hw.ncpu: 12\nkernel.ostype = Linux"), {"hw.ncpu": "12", "kernel.ostype": "Linux"})
+end
+
+def test_vm_stat_parse():
+  assert_eq(vm_stat_parse("Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:    100.\n\"Pages purgeable\":   5."), {"pages_free": 100, "pages_purgeable": 5, "page_size": 16384})
+end
+
+def test_vmstat_parse_uses_second_header_line():
+  assert_eq(vmstat_parse("procs ---memory---\n r  b  free\n 1  0  100"), [{"r": 1, "b": 0, "free": 100}])
+end
+
+def test_top_parse_skips_summary():
+  assert_eq(top_parse("load avg\n  PID USER %CPU COMMAND\n  1 root 0.5 init"), [{"pid": 1, "user": "root", "cpu_percent": 0.5, "command": "init"}])
+end
+
+def test_launchctl_list_parse_dash_pid_is_none():
+  assert_eq(launchctl_list_parse("PID\tStatus\tLabel\n-\t0\tcom.example.job\n123\t0\tcom.example.run"), [{"pid": None, "status": 0, "label": "com.example.job"}, {"pid": 123, "status": 0, "label": "com.example.run"}])
+end
+
+def test_ifconfig_parse_macos():
+  let result = ifconfig_parse("lo0: flags=8049<UP,LOOPBACK> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\n\tinet6 ::1 prefixlen 128\nen0: flags=8863<UP,BROADCAST> mtu 1500\n\tether aa:bb:cc:dd:ee:ff\n\tstatus: active")
+  | assert_eq(len(result), 2)
+  | assert_eq(result[0], {"name": "lo0", "flags": ["UP", "LOOPBACK"], "mtu": 16384, "ipv4": [{"address": "127.0.0.1", "netmask": "0xff000000"}], "ipv6": [{"address": "::1", "prefixlen": 128}]})
+  | assert_eq(result[1]["ether"], "aa:bb:cc:dd:ee:ff")
+  | assert_eq(result[1]["status"], "active")
+end
+
+def test_netstat_parse_linux_and_macos():
+  let result = netstat_parse("Proto Recv-Q Send-Q Local Address Foreign Address State PID/Program name\ntcp 0 0 0.0.0.0:22 0.0.0.0:* LISTEN 812/sshd\ntcp4 0 0 127.0.0.1.8080 *.* LISTEN\nudp4 0 0 *.5353 *.*")
+  | assert_eq(len(result), 3)
+  | assert_eq(result[0], {"proto": "tcp", "recv_q": 0, "send_q": 0, "local_address": "0.0.0.0:22", "foreign_address": "0.0.0.0:*", "state": "LISTEN", "program": "812/sshd"})
+  | assert_eq(result[2], {"proto": "udp4", "recv_q": 0, "send_q": 0, "local_address": "*.5353", "foreign_address": "*.*"})
+end
+
+def test_mdls_parse_unquotes_and_null():
+  assert_eq(mdls_parse("kMDItemKind = \"Text\"\nkMDItemFSSize = 6\nkMDItemNote = (null)"), {"kMDItemKind": "Text", "kMDItemFSSize": "6", "kMDItemNote": None})
+end
+
+def test_otool_l_parse():
+  assert_eq(otool_l_parse("/bin/ls:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1351.0.0)"), [{"path": "/usr/lib/libSystem.B.dylib", "compatibility_version": "1.0.0", "current_version": "1351.0.0"}])
+end
+
+def test_unzip_list_parse_skips_header_and_totals():
+  assert_eq(unzip_list_parse("  Length      Date    Time    Name\n---------  ---------- -----   ----\n        6  09-20-2026 14:38   a.txt\n---------                     -------\n        6                     1 file"), [{"size": 6, "date": "09-20-2026", "time": "14:38", "name": "a.txt"}])
+end
+
+def test_tar_parse_gnu_and_bsdtar():
+  assert_eq(tar_parse("-rw-r--r-- alice/staff 12 2024-01-01 12:00 a.txt"), [{"permissions": "-rw-r--r--", "owner": "alice/staff", "size": 12, "modified": "2024-01-01 12:00", "name": "a.txt"}])
+  | assert_eq(tar_parse("-rw-r--r--  0 alice staff      6 Sep 20 14:38 a.txt")[0]["name"], "a.txt")
+end
+
+def test_git_log_oneline_parse():
+  assert_eq(git_log_oneline_parse("abc1234 (HEAD -> main) fix bug\ndef5678 add feature"), [{"commit": "abc1234", "message": "fix bug", "refs": "HEAD -> main"}, {"commit": "def5678", "message": "add feature"}])
+end
+
+def test_git_shortlog_parse():
+  assert_eq(git_shortlog_parse("    12\tAlice <a@x.dev>\n     3\tBob"), [{"commits": 12, "author": "Alice", "email": "a@x.dev"}, {"commits": 3, "author": "Bob"}])
+end
+
+def test_git_remote_parse():
+  assert_eq(git_remote_parse("origin\thttps://example.com/r.git (fetch)\norigin\thttps://example.com/r.git (push)"), [{"name": "origin", "url": "https://example.com/r.git", "direction": "fetch"}, {"name": "origin", "url": "https://example.com/r.git", "direction": "push"}])
+end
+
+def test_git_stash_list_parse():
+  assert_eq(git_stash_list_parse("stash@{0}: WIP on main: abc1234 fix bug\nstash@{1}: On dev: manual"), [{"index": 0, "ref": "stash@{0}", "branch": "main", "message": "abc1234 fix bug"}, {"index": 1, "ref": "stash@{1}", "branch": "dev", "message": "manual"}])
+end
+
+def test_git_reflog_parse():
+  assert_eq(git_reflog_parse("abc1234 HEAD@{0}: commit: fix bug\ndef5678 HEAD@{1}: checkout: moving from a to b"), [{"commit": "abc1234", "ref": "HEAD@{0}", "action": "commit", "message": "fix bug"}, {"commit": "def5678", "ref": "HEAD@{1}", "action": "checkout", "message": "moving from a to b"}])
+end
+
+def test_git_diff_numstat_parse_binary_is_none():
+  assert_eq(git_diff_numstat_parse("12\t3\tsrc/a.rs\n-\t-\timg.png"), [{"added": 12, "deleted": 3, "path": "src/a.rs"}, {"added": None, "deleted": None, "path": "img.png"}])
+end
+
+def test_git_diff_stat_parse():
+  assert_eq(git_diff_stat_parse(" src/a.rs | 5 ++---\n img.png | Bin 0 -> 12 bytes\n 2 files changed, 2 insertions(+), 3 deletions(-)"), {"files": [{"path": "src/a.rs", "changes": 5}, {"path": "img.png", "binary": true}], "files_changed": 2, "insertions": 2, "deletions": 3})
+end
+
+def test_git_worktree_parse():
+  assert_eq(git_worktree_parse("/repo  abc1234 [main]\n/repo/wt  def5678 (detached HEAD)"), [{"path": "/repo", "commit": "abc1234", "branch": "main"}, {"path": "/repo/wt", "commit": "def5678", "state": "detached HEAD"}])
+end
+
+def test_pip_freeze_parse():
+  assert_eq(pip_freeze_parse("requests==2.31.0\nmypkg @ file:///src/mypkg"), [{"name": "requests", "version": "2.31.0"}, {"name": "mypkg", "url": "file:///src/mypkg"}])
+end
+
+def test_pip_show_parse_multiple_packages():
+  assert_eq(pip_show_parse("Name: a\nVersion: 1\n---\nName: b\nVersion: 2"), [{"Name": "a", "Version": "1"}, {"Name": "b", "Version": "2"}])
+end
+
+def test_brew_list_parse():
+  assert_eq(brew_list_parse("jq 1.7.1\ngit 2.45.0 2.44.0\nwget"), [{"name": "jq", "versions": ["1.7.1"]}, {"name": "git", "versions": ["2.45.0", "2.44.0"]}, {"name": "wget", "versions": []}])
+end
+
+def test_brew_outdated_parse():
+  assert_eq(brew_outdated_parse("jq (1.6) < 1.7.1\nwget"), [{"name": "jq", "installed_versions": ["1.6"], "current_version": "1.7.1"}, {"name": "wget"}])
+end
+
+def test_gem_list_parse():
+  assert_eq(gem_list_parse("rake (13.0.6, default: 12.0)"), [{"name": "rake", "versions": ["13.0.6", "default: 12.0"]}])
+end
+
+def test_cargo_install_list_parse():
+  assert_eq(cargo_install_list_parse("mq-run v0.8.5:\n    mq\nmytool v0.1.0 (/src/mytool):\n    a\n    b"), [{"name": "mq-run", "version": "0.8.5", "binaries": ["mq"]}, {"name": "mytool", "version": "0.1.0", "binaries": ["a", "b"], "source": "/src/mytool"}])
+end
+
+def test_npm_ls_parse_depth_and_scoped_names():
+  assert_eq(npm_ls_parse("app@1.0.0 /src/app\n├── left-pad@1.3.0\n├─┬ express@4.18.2\n│ └── body-parser@1.20.1\n└── @scope/pkg@2.0.0"), [{"name": "left-pad", "version": "1.3.0", "depth": 1}, {"name": "express", "version": "4.18.2", "depth": 1}, {"name": "body-parser", "version": "1.20.1", "depth": 2}, {"name": "@scope/pkg", "version": "2.0.0", "depth": 1}])
+end
+
+def test_dpkg_list_parse_skips_header():
+  assert_eq(dpkg_list_parse("||/ Name Version Architecture Description\n+++-==-==-==-==\nii  adduser  3.118  all  add and remove users"), [{"status": "ii", "name": "adduser", "version": "3.118", "architecture": "all", "description": "add and remove users"}])
+end
+
+def test_apt_list_parse():
+  assert_eq(apt_list_parse("Listing... Done\ncurl/jammy-updates,now 7.81.0-1 amd64 [installed]"), [{"name": "curl", "suite": "jammy-updates,now", "version": "7.81.0-1", "architecture": "amd64", "status": "installed"}])
+end
+
+def test_pacman_q_parse():
+  assert_eq(pacman_q_parse("linux 6.6.1.arch1-1"), [{"name": "linux", "version": "6.6.1.arch1-1"}])
+end
+
+def test_conda_list_parse_skips_comments():
+  assert_eq(conda_list_parse("# packages in environment\n#\n# Name Version Build Channel\nnumpy 1.26.4 py311h1 conda-forge\nzlib 1.2.13 h1"), [{"name": "numpy", "version": "1.26.4", "build": "py311h1", "channel": "conda-forge"}, {"name": "zlib", "version": "1.2.13", "build": "h1", "channel": ""}])
+end
+
+def test_dnf_list_parse():
+  assert_eq(dnf_list_parse("Installed Packages\nbash.x86_64  5.2.15-3.fc39  @anaconda"), [{"name": "bash", "architecture": "x86_64", "version": "5.2.15-3.fc39", "repo": "@anaconda"}])
+end
+
+def test_helm_list_parse_tab_separated():
+  assert_eq(helm_list_parse("NAME\tNAMESPACE\tREVISION\tAPP VERSION\nweb\tprod\t3\t1.16"), [{"name": "web", "namespace": "prod", "revision": 3, "app_version": "1.16"}])
+end
+
+def test_snap_list_parse():
+  assert_eq(snap_list_parse("Name Version Rev Tracking Publisher Notes\ncore20 20240111 2182 latest/stable canonical** base"), [{"name": "core20", "version": "20240111", "rev": 2182, "tracking": "latest/stable", "publisher": "canonical**", "notes": "base"}])
+end
+
+def test_ip_addr_parse_brief():
+  assert_eq(ip_addr_parse("lo UNKNOWN 127.0.0.1/8 ::1/128\neth0 UP 10.0.0.2/24"), [{"name": "lo", "state": "UNKNOWN", "addresses": ["127.0.0.1/8", "::1/128"]}, {"name": "eth0", "state": "UP", "addresses": ["10.0.0.2/24"]}])
+end
+
+def test_ip_addr_parse_full():
+  let result = ip_addr_parse("1: lo: <LOOPBACK,UP> mtu 65536 qdisc noqueue state UNKNOWN group default\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n    inet 127.0.0.1/8 scope host lo\n    inet6 ::1/128 scope host\n2: eth0: <BROADCAST,UP> mtu 1500 qdisc fq_codel state UP group default\n    link/ether aa:bb:cc:dd:ee:ff brd ff:ff:ff:ff:ff:ff\n    inet 10.0.0.2/24 brd 10.0.0.255 scope global eth0")
+  | assert_eq(result[0], {"index": 1, "name": "lo", "flags": ["LOOPBACK", "UP"], "mtu": 65536, "state": "UNKNOWN", "mac": "00:00:00:00:00:00", "ipv4": ["127.0.0.1/8"], "ipv6": ["::1/128"]})
+  | assert_eq(result[1]["ipv4"], ["10.0.0.2/24"])
+  | assert_eq(result[1]["ipv6"], [])
+end
+
+def test_ip_route_parse_pairs_flags_and_type():
+  assert_eq(ip_route_parse("default via 192.168.1.1 dev eth0 proto dhcp metric 100\n192.168.1.0/24 dev eth0 scope link linkdown\nblackhole 10.9.0.0/16"), [{"destination": "default", "via": "192.168.1.1", "dev": "eth0", "proto": "dhcp", "metric": 100}, {"destination": "192.168.1.0/24", "dev": "eth0", "scope": "link", "flags": ["linkdown"]}, {"destination": "10.9.0.0/16", "type": "blackhole"}])
+end
+
+def test_ss_parse_with_and_without_netid():
+  assert_eq(ss_parse("Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\ntcp LISTEN 0 4096 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=1,fd=3))")[0], {"netid": "tcp", "state": "LISTEN", "recv_q": 0, "send_q": 4096, "local_address": "0.0.0.0:22", "peer_address": "0.0.0.0:*", "process": "users:((\"sshd\",pid=1,fd=3))"})
+  | assert_eq(ss_parse("State Recv-Q Send-Q Local Address:Port Peer Address:Port\nLISTEN 0 128 *:80 *:*"), [{"state": "LISTEN", "recv_q": 0, "send_q": 128, "local_address": "*:80", "peer_address": "*:*"}])
+end
+
+def test_lsblk_parse_strips_tree_glyphs():
+  assert_eq(lsblk_parse("NAME MAJ:MIN RM SIZE RO TYPE MOUNTPOINTS\nsda 8:0 0 100G 0 disk\n├─sda1 8:1 0 512M 0 part /boot/efi"), [{"name": "sda", "maj_min": "8:0", "rm": 0, "size": "100G", "ro": 0, "type": "disk", "mountpoints": ""}, {"name": "sda1", "maj_min": "8:1", "rm": 0, "size": "512M", "ro": 0, "type": "part", "mountpoints": "/boot/efi"}])
+end
+
+def test_blkid_parse():
+  assert_eq(blkid_parse("/dev/sda1: UUID=\"abc-1\" TYPE=\"ext4\" PARTUUID=\"p-1\""), [{"device": "/dev/sda1", "uuid": "abc-1", "type": "ext4", "partuuid": "p-1"}])
+end
+
+def test_lsmod_parse():
+  assert_eq(lsmod_parse("Module Size Used by\nnf_tables 250000 5 nft_ct,nft_chain\nvfat 20480 1"), [{"module": "nf_tables", "size": 250000, "used": 5, "used_by": "nft_ct,nft_chain"}, {"module": "vfat", "size": 20480, "used": 1, "used_by": ""}])
+end
+
+def test_lspci_and_lsusb_parse():
+  assert_eq(lspci_parse("00:1f.2 SATA controller: Intel Corporation 82801"), [{"slot": "00:1f.2", "class": "SATA controller", "description": "Intel Corporation 82801"}])
+  | assert_eq(lsusb_parse("Bus 001 Device 002: ID 8087:0024 Intel Corp. Hub"), [{"bus": "001", "device": "002", "id": "8087:0024", "description": "Intel Corp. Hub"}])
+end
+
+def test_dmesg_parse_seconds_and_dates():
+  assert_eq(dmesg_parse("[   12.345678] usb 1-1: new device\n[Sat Sep 20 12:00:00 2026] eth0: link up"), [{"time": 12.345678, "message": "usb 1-1: new device"}, {"time": "Sat Sep 20 12:00:00 2026", "message": "eth0: link up"}])
+end
+
+def test_syslog_parse_classic_and_iso():
+  assert_eq(syslog_parse("Sep 20 12:00:01 web sshd[123]: Accepted key\n2026-09-20T12:00:02+0900 web kernel: oops"), [{"timestamp": "Sep 20 12:00:01", "host": "web", "process": "sshd", "message": "Accepted key", "pid": 123}, {"timestamp": "2026-09-20T12:00:02+0900", "host": "web", "process": "kernel", "message": "oops"}])
+end
+
+def test_systemctl_parse_drops_footer_and_marker():
+  assert_eq(systemctl_parse("  UNIT LOAD ACTIVE SUB DESCRIPTION\n● foo.service loaded failed failed Foo daemon\n  ssh.service loaded active running OpenBSD Secure Shell server\n\n2 loaded units listed."), [{"unit": "foo.service", "load": "loaded", "active": "failed", "sub": "failed", "description": "Foo daemon"}, {"unit": "ssh.service", "load": "loaded", "active": "active", "sub": "running", "description": "OpenBSD Secure Shell server"}])
+  | assert_eq(systemctl_parse("UNIT FILE STATE PRESET\nssh.service enabled enabled\n\n1 unit files listed."), [{"unit_file": "ssh.service", "state": "enabled", "preset": "enabled"}])
+end
+
+def test_ldd_parse_found_missing_and_loader():
+  assert_eq(ldd_parse("\tlibc.so.6 => /lib/libc.so.6 (0x00007f00)\n\tlibx.so => not found\n\t/lib64/ld-linux-x86-64.so.2 (0x00007f11)"), [{"name": "libc.so.6", "path": "/lib/libc.so.6", "address": "0x00007f00"}, {"name": "libx.so", "path": None}, {"name": "ld-linux-x86-64.so.2", "path": "/lib64/ld-linux-x86-64.so.2", "address": "0x00007f11"}])
+end
+
+def test_traceroute_parse_resolved_silent_and_numeric_hops():
+  assert_eq(traceroute_parse(" 1  gw (192.168.1.1)  1.2 ms  1.1 ms\n 2  * * *\n 3  10.0.0.1  5.5 ms"), [{"hop": 1, "rtts": [1.2, 1.1], "host": "gw", "ip": "192.168.1.1"}, {"hop": 2, "rtts": []}, {"hop": 3, "rtts": [5.5], "ip": "10.0.0.1"}])
+end
+
+def test_dig_parse_answer_records():
+  assert_eq(dig_parse(";; ANSWER SECTION:\nexample.com.\t300\tIN\tA\t93.184.216.34\nexample.com. 300 IN MX 10 mail.example.com."), [{"name": "example.com.", "ttl": 300, "class": "IN", "type": "A", "data": "93.184.216.34"}, {"name": "example.com.", "ttl": 300, "class": "IN", "type": "MX", "data": "10 mail.example.com."}])
+end
+
+def test_curl_headers_parse_uses_last_response():
+  assert_eq(curl_headers_parse("HTTP/1.1 301 Moved Permanently\r\nLocation: /x\r\n\r\nHTTP/2 200\r\nContent-Type: text/html\r\n\r\n"), {"http_version": "2", "status": 200, "headers": {"content-type": "text/html"}})
+  | assert_eq(curl_headers_parse("not http"), {})
+end
+
+def test_ssh_keygen_parse():
+  assert_eq(ssh_keygen_parse("256 SHA256:abc alice@host (ED25519)"), [{"bits": 256, "fingerprint": "SHA256:abc", "comment": "alice@host", "type": "ED25519"}])
+end
+
+def test_passwd_and_group_parse():
+  assert_eq(passwd_parse("# c\nroot:x:0:0:root:/root:/bin/bash"), [{"user": "root", "password": "x", "uid": 0, "gid": 0, "comment": "root", "home": "/root", "shell": "/bin/bash"}])
+  | assert_eq(group_parse("staff:*:20:alice,bob\nnobody:*:-2:"), [{"name": "staff", "password": "*", "gid": 20, "members": ["alice", "bob"]}])
+end
+
+def test_hosts_parse_skips_comments():
+  assert_eq(hosts_parse("# hosts\n127.0.0.1 localhost lo # loopback\n\n::1 ip6-localhost"), [{"ip": "127.0.0.1", "hostname": "localhost", "aliases": ["lo"]}, {"ip": "::1", "hostname": "ip6-localhost", "aliases": []}])
+end
+
+def test_os_release_parse_unquotes():
+  assert_eq(os_release_parse("# c\nNAME=\"Ubuntu\"\nID=ubuntu\nQ='x y'"), {"NAME": "Ubuntu", "ID": "ubuntu", "Q": "x y"})
+end
+
+def test_time_parse_bash_and_posix():
+  assert_eq(time_parse("real\t1m2.500s\nuser\t0m0.250s\nsys\t0m0.100s"), {"real": 62.5, "user": 0.25, "sys": 0.1})
+  | assert_eq(time_parse("real 1.23\nuser 0.5\nsys 0.1"), {"real": 1.23, "user": 0.5, "sys": 0.1})
+end
+
+def test_detect_finds_unique_signature():
+  assert_eq(detect("uid=501(alice) gid=20(staff)"), ["id"])
+  | assert_eq(detect("USER PID %CPU %MEM VSZ RSS TT STAT STARTED TIME COMMAND\nroot 1 0 0 1 1 ?? Ss 9:00 0:00 init"), ["ps"])
+  | assert_eq(detect("hello world"), [])
+end
+
+def test_detect_never_claims_generic_formats():
+  assert_eq(detect("1 3 6 a.txt"), [])
+  | assert_eq(detect(" M src/a.rs\n?? b.txt"), [])
+end
+
+def test_parse_auto_parses_when_unique():
+  assert_eq(parse_auto("uid=0(root) gid=0(root)"), {"uid": 0, "user": "root", "gid": 0, "group": "root"})
+  | assert_eq(parse_auto("2 packets transmitted, 2 received, 0% packet loss")["received"], 2)
+end
+
+def test_parse_auto_errors_when_nothing_matches():
+  assert_eq(try: parse_auto("hello world") catch: "error", "error")
+end
+
+def test_parse_auto_errors_when_ambiguous():
+  let text = "State Recv-Q Send-Q Local Address:Port Peer Address:Port\ntcp4 0 0 127.0.0.1.80 *.* LISTEN"
+  | assert_eq(detect(text), ["netstat", "ss"])
+  | assert_eq(try: parse_auto(text) catch: "error", "error")
+end
+
+def test_detect_refuses_text_that_mixes_formats():
+  assert_eq(detect("uid=1(a) gid=1(a)\n-rw-r--r--  1 a staff 12 Jan  1 12:00 f"), [])
+end
+
+def test_parser_key_uses_subcommand_and_aliases():
+  assert_eq(_parser_key("git", ["-C", "x", "log", "-2"]), "git log")
+  | assert_eq(_parser_key("/usr/bin/pip3", ["list"]), "pip list")
+  | assert_eq(_parser_key("kubectl", ["-n", "prod", "get", "pods"]), "kubectl get")
+  | assert_eq(_parser_key("podman", ["ps"]), "docker ps")
+  | assert_eq(_parser_key("yum", ["list", "installed"]), "dnf list")
+  | assert_eq(_parser_key("ps", ["aux"]), "ps")
+end
+
+def test_parse_output_resolves_aliases_and_rejects_unknown_subcommands():
+  assert_eq(parse_output("md5sum", "d41d8cd98f00b204e9800998ecf8427e  a"), [{"hash": "d41d8cd98f00b204e9800998ecf8427e", "file": "a"}])
+  | assert_eq(parse_output("ip a", "lo UNKNOWN 127.0.0.1/8")[0]["name"], "lo")
+  | assert_eq(try: parse_output("git blame", "x") catch: "error", "error")
+end
+
+def test_parse_output_reaches_generic_git_formats_by_name():
+  assert_eq(parse_output("git log --oneline", "abc1234 fix bug"), [{"commit": "abc1234", "message": "fix bug"}])
+  | assert_eq(parse_output("git diff --numstat", "1\t2\ta.rs"), [{"added": 1, "deleted": 2, "path": "a.rs"}])
+end
+
+def _sig_fixtures():
+  [
+    ["ps", "USER PID %CPU %MEM VSZ RSS TT STAT STARTED TIME COMMAND\nroot 1 0.5 0.1 100 200 ?? Ss 9:00 0:01 /sbin/init"],
+    ["df", "Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/sda1 100 40 60 40% /"],
+    ["ls", "total 8\n-rw-r--r--@  1 alice  staff   12 Jan  1 12:00 my file.txt\ndrwxr-xr-x   5 alice  staff  160 Dec 25  2023 src"],
+    ["id", "uid=501(alice) gid=20(staff) groups=20(staff),12(everyone)"],
+    ["ping", "2 packets transmitted, 2 packets received, 0.0% packet loss\nround-trip min/avg/max/stddev = 0.6/0.9/1.1/0.2 ms"],
+    ["lsof", "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nzsh 42 alice cwd DIR 1,19 288 1 /tmp"],
+    ["free", "               total        used        free\nMem:        16336000     4200000     5000000"],
+    ["top", "load avg\n  PID USER %CPU COMMAND\n  1 root 0.5 init"],
+    ["uptime", "14:38  up 1:54, 1 user, load averages: 3.09 3.24 5.65"],
+    ["w", "12:34 up 1 day\nUSER TTY FROM LOGIN@ IDLE WHAT\nalice ttys000 - 09:00 1 -zsh"],
+    ["mount", "/dev/disk3s1s1 on / (apfs, sealed, local)\nsysfs on /sys type sysfs (rw,nosuid)"],
+    ["uname", "Linux host 5.15.0 #1 SMP Mon x86_64 x86_64 x86_64 GNU/Linux"],
+    ["vm_stat", "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:    100."],
+    ["vmstat", "procs ---memory---\n r  b   swpd   free\n 1  0      0    100"],
+    ["launchctl", "PID\tStatus\tLabel\n-\t0\tcom.example.job"],
+    ["ifconfig", "lo0: flags=8049<UP,LOOPBACK> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000"],
+    ["netstat", "Proto Recv-Q Send-Q Local Address Foreign Address State\ntcp4 0 0 127.0.0.1.8080 *.* LISTEN"],
+    ["ss", "Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\ntcp LISTEN 0 4096 0.0.0.0:22 0.0.0.0:*"],
+    ["arp", "? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]"],
+    ["ip addr", "lo UNKNOWN 127.0.0.1/8 ::1/128\neth0 UP 10.0.0.2/24"],
+    ["mdls", "kMDItemKind = \"Text\"\nkMDItemFSSize = 6"],
+    ["otool", "/bin/ls:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1351.0.0)"],
+    ["unzip", "Archive:  z.zip\n  Length      Date    Time    Name\n---------  ---------- -----   ----\n        6  09-20-2026 14:38   a.txt"],
+    ["checksum", "d41d8cd98f00b204e9800998ecf8427e  empty.txt"],
+    ["lsblk", "NAME MAJ:MIN RM SIZE RO TYPE MOUNTPOINTS\nsda 8:0 0 100G 0 disk"],
+    ["blkid", "/dev/sda1: UUID=\"abc-1\" TYPE=\"ext4\""],
+    ["lsmod", "Module Size Used by\nvfat 20480 1"],
+    ["lspci", "00:1f.2 SATA controller: Intel Corporation 82801"],
+    ["lsusb", "Bus 001 Device 002: ID 8087:0024 Intel Corp. Hub"],
+    ["dmesg", "[   12.345678] usb 1-1: new device"],
+    ["syslog", "Sep 20 12:00:01 web sshd[123]: Accepted key"],
+    ["systemctl", "  UNIT LOAD ACTIVE SUB DESCRIPTION\nssh.service loaded active running OpenBSD Secure Shell server"],
+    ["ldd", "\tlibc.so.6 => /lib/libc.so.6 (0x00007f00)\n\tlibx.so => not found"],
+    ["traceroute", " 1  gw (192.168.1.1)  1.2 ms  1.1 ms\n 2  * * *"],
+    ["dig", ";; ANSWER SECTION:\nexample.com.\t300\tIN\tA\t93.184.216.34"],
+    ["curl", "HTTP/2 200\r\nContent-Type: text/html\r\n\r\n"],
+    ["ssh-keygen", "256 SHA256:abc alice@host (ED25519)"],
+    ["passwd", "# c\nroot:x:0:0:root:/root:/bin/bash"],
+    ["group", "staff:*:20:alice,bob"],
+    ["os-release", "NAME=\"Ubuntu\"\nPRETTY_NAME=\"Ubuntu 22.04 LTS\""],
+    ["time", "real\t1m2.500s\nuser\t0m0.250s\nsys\t0m0.100s"],
+    ["sw_vers", "ProductName:\tmacOS\nProductVersion: 27.0"],
+    ["lscpu", "Architecture: x86_64\nCPU(s): 8"],
+    ["hostnamectl", "   Static hostname: web\n         Icon name: computer-vm"],
+    ["timedatectl", "               Local time: Sat 2026-09-20 12:00:00 JST\n           Universal time: Sat 2026-09-20 03:00:00 UTC"],
+    ["git log", "commit abc1234 (HEAD -> main)\nAuthor: A <a@x.dev>\nDate:   Mon Jan 1 12:00:00 2024 +0000\n\n    fix bug\n"],
+    ["git diff --stat", " src/a.rs | 5 ++---\n 1 file changed, 2 insertions(+), 3 deletions(-)"],
+    ["git remote", "origin\thttps://example.com/r.git (fetch)\norigin\thttps://example.com/r.git (push)"],
+    ["git stash", "stash@{0}: WIP on main: abc1234 fix bug"],
+    ["git reflog", "abc1234 HEAD@{0}: commit: fix bug"],
+    ["pip list", "Package    Version\n---------- -------\npip        26.1.1"],
+    ["pip freeze", "requests==2.31.0\nmypkg @ file:///src/mypkg"],
+    ["pip show", "Name: pip\nVersion: 26.1.1"],
+    ["brew services", "Name   Status User File\nmactop none"],
+    ["gem list", "*** LOCAL GEMS ***\n\nrake (13.0.6, default: 12.0)"],
+    ["cargo install", "mq-run v0.8.5:\n    mq"],
+    ["npm ls", "app@1.0.0 /src/app\n├── left-pad@1.3.0"],
+    ["dpkg", "||/ Name Version Architecture Description\n+++-==-==-==-==\nii  adduser  3.118  all  add and remove users"],
+    ["apt list", "Listing... Done\ncurl/jammy-updates,now 7.81.0-1 amd64 [installed]"],
+    ["dnf list", "Installed Packages\nbash.x86_64  5.2.15-3.fc39  @anaconda"],
+    ["conda list", "# packages in environment\n#\n# Name Version Build Channel\nnumpy 1.26.4 py311h1 conda-forge"],
+    ["snap list", "Name Version Rev Tracking Publisher Notes\ncore20 20240111 2182 latest/stable canonical** base"],
+    ["helm list", "NAME\tNAMESPACE\tREVISION\nweb\tprod\t3"],
+    ["docker ps", "CONTAINER ID   IMAGE     COMMAND   STATUS\nabc123         nginx     \"nginx\"   Up 2 hours"],
+    ["docker images", "REPOSITORY   TAG      IMAGE ID\nnginx        latest   abc123"],
+    ["docker stats", "CONTAINER ID   NAME   CPU %   MEM USAGE\nabc123         web    0.5%    10MiB"],
+    ["docker volume", "DRIVER    VOLUME NAME\nlocal     data"],
+    ["docker network", "NETWORK ID     NAME      DRIVER    SCOPE\nabc123         bridge    bridge    local"],
+    ["kubectl get", "NAME   READY   STATUS    RESTARTS   AGE\nweb    1/1     Running   0          2d"],
+    ["kubectl top", "NAME   CPU(cores)   MEMORY(bytes)\nweb    5m           20Mi"],
+    ["date", "Sun Sep 20 16:48:49 JST 2026"],
+    ["stat", "16777235 17789871 -rw-r--r-- 1 root wheel 0 230 \"Aug 15 11:07:33 2026\" \"Aug 15 11:07:33 2026\" \"Sep 15 21:14:34 2026\" \"Aug  2 08:15:31 2026\" 4096 8 0 /etc/hosts"],
+    ["last", "alice  console  Sun Sep 20 12:45   still logged in\nreboot  time  Sun Sep 20 12:43\n\nwtmp begins Sun Sep  6 09:00"],
+    ["route", "Kernel IP routing table\nDestination Gateway Genmask Flags Metric Ref Use Iface\n0.0.0.0 192.168.1.1 0.0.0.0 UG 100 0 0 eth0"],
+    ["route get", "   route to: default\ndestination: default\n    gateway: 192.168.1.1"],
+    ["zipinfo", "Archive:  z.zip\nZip file size: 310 bytes, number of entries: 1\n-rw-r--r--  3.0 unx        6 tx stor 26-Sep-20 14:38 a.txt\n1 file, 6 bytes uncompressed, 6 bytes compressed:  0.0%"],
+    ["gzip", "  compressed  uncompressed  ratio uncompressed_name\n          32           6 -99.9% h.txt"],
+    ["hexdump", "00000000  68 65 6c 6c 6f 0a                                 |hello.|\n00000006"],
+    ["tree", ".\n├── src\n│   └── a.rs\n└── README.md\n\n1 directory, 2 files"],
+    ["diskutil list", "/dev/disk0 (internal, physical):\n   #:                       TYPE NAME                    SIZE       IDENTIFIER\n   0:      GUID_partition_scheme                        *251.0 GB   disk0"],
+    ["diskutil info", "   Device Identifier:         disk3s1\n   Device Node:              /dev/disk3s1"],
+    ["pmset batt", "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1)\t57%; discharging; 5:38 remaining present: true"],
+    ["csrutil", "System Integrity Protection status: enabled."],
+    ["spctl", "assessments enabled"],
+    ["networksetup -listallhardwareports", "Hardware Port: Wi-Fi\nDevice: en0\nEthernet Address: aa:bb:cc:dd:ee:ff"],
+    ["memory_pressure", "The system has 8589934592 (524288 pages with a page size of 16384).\n\nStats: \nPages free: 4435 "],
+    ["lsattr", "--------------e------- ./a.txt\n----i---------e------- ./b.txt"],
+    ["findmnt", "TARGET SOURCE FSTYPE OPTIONS\n/ /dev/sda1 ext4 rw,relatime"],
+    ["swapon", "NAME TYPE SIZE USED PRIO\n/swapfile file 2G 0B -2"],
+    ["getfacl", "# file: a\n# owner: root\n# group: root\nuser::rw-\nother::r--"],
+    ["getcap", "/usr/bin/ping cap_net_raw=ep"],
+    ["host", "example.com has address 93.184.216.34\nexample.com mail is handled by 10 mail.example.com."],
+    ["nslookup", "Server:\t8.8.8.8\nAddress:\t8.8.8.8#53\n\nName:\texample.com\nAddress: 93.184.216.34"],
+    ["nmcli connection", "NAME         UUID                                  TYPE      DEVICE\nWired conn   aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee  ethernet  eth0"],
+    ["nmcli device", "DEVICE  TYPE      STATE      CONNECTION\neth0    ethernet  connected  Wired conn"],
+    ["loginctl list-sessions", "SESSION UID USER SEAT TTY\n      1 1000 alice seat0 tty1\n\n1 sessions listed."],
+    ["loginctl list-users", "UID USER LINGER STATE\n1000 alice no active\n\n1 users listed."],
+    ["localectl", "   System Locale: LANG=en_US.UTF-8\n       VC Keymap: us"],
+    ["lsb_release", "Distributor ID:\tUbuntu\nDescription:\tUbuntu 22.04.3 LTS"],
+    ["lsns", "        NS TYPE   NPROCS PID USER COMMAND\n4026531835 cgroup    120   1 root /sbin/init"],
+    ["lslocks", "COMMAND PID TYPE SIZE MODE M START END PATH\nsshd 812 FLOCK 0B WRITE 0 0 0 /run/sshd.pid"],
+    ["lsmem", "RANGE SIZE STATE REMOVABLE BLOCK\n0x0-0x7fffffff 2G online yes 0-15\n\nMemory block size: 128M"],
+    ["lslogins", "UID USER PROC PWD-LOCK PWD-DENY LAST-LOGIN GECOS\n0 root 120 0 0 2026-09-20T12:00:00 root"],
+    ["apt-cache madison", "      curl |   7.81.0-1ubuntu1 | http://archive.ubuntu.com/ubuntu jammy/main amd64 Packages"],
+    ["dpkg status", "Package: curl\nStatus: install ok installed\nVersion: 7.81.0"],
+    ["ulimit", "core file size          (blocks, -c) 0\nopen files                      (-n) 256\ncpu time               (seconds, -t) unlimited"],
+    ["pdfinfo", "Title:          Report\nPDF version:    1.7\nPages:          3"],
+    ["chage", "Last password change\t\t\t\t\t: Sep 20, 2026\nPassword expires\t\t\t\t\t: never"],
+    ["apt-config dump", "APT::Architecture \"amd64\";\nAPT::Install-Recommends \"true\";\nAcquire::http::Timeout \"120\";"],
+    ["debconf-show", "* tzdata/Areas: Asia\n  tzdata/Zones/Asia: Tokyo"],
+    ["uuidparse", "UUID                                 VARIANT   TYPE       TIME\n0c65d8cf-2f5d-11ee-be56-0242ac120002 DCE       time-based 2023-07-28 10:00:00,123456+00:00"],
+    ["nstat", "#kernel\nIpInReceives                  12345              0.0\nIcmpInMsgs                      3                  0.0"],
+    ["ionice", "best-effort: prio 4"],
+    ["pmap", "1234:   /usr/bin/bash\n0000000000400000    132K r-x-- bash\n0000000000621000      4K r---- bash\n total     2048K"],
+    ["bluetoothctl show", "Controller AA:BB:CC:DD:EE:FF (public)\n\tName: host\n\tPowered: yes"],
+    ["system_profiler", "Hardware:\n\n    Hardware Overview:\n\n      Model Name: MacBook Neo\n      Chip: Apple A18 Pro\n"],
+    ["ip neighbour", "192.168.1.1 dev eth0 lladdr 00:11:22:33:44:55 REACHABLE\n192.168.1.9 dev eth0 FAILED"],
+    ["netstat routes", "Routing tables\n\nInternet:\nDestination        Gateway            Flags               Netif Expire\ndefault            100.64.1.1         UGScg                 en0       \n100.64/22          link#5             UCS                   en0      !\n\nInternet6:\nDestination                             Gateway                         Flags               Netif Expire\ndefault                                 fe80::1%en0                     UGcg                  en0       "],
+    ["networksetup -listnetworkserviceorder", "An asterisk (*) denotes that a network service is disabled.\n(1) Wi-Fi\n(Hardware Port: Wi-Fi, Device: en0)\n\n(*) Old VPN\n(Hardware Port: VPN, Device: )\n"],
+    ["networksetup -getinfo", "DHCP Configuration\nIP address: 100.64.1.102\nSubnet mask: 255.255.252.0\nRouter: 100.64.1.1\nClient ID: \nIPv6: Automatic\n"],
+    ["xxd", "00000000: 6865 6c6c 6f20 776f 726c 642c 2074 6869  hello world, thi\n00000010: 0a                                       ."],
+    ["lipo", "Architectures in the fat file: /bin/ls are: x86_64 arm64e arm64e.x1 \n"],
+    ["pmset", "System-wide power settings:\nCurrently in use:\n standby              1\n Sleep On Power Button 1\n hibernatefile        /var/vm/sleepimage\n sleep                1 (sleep prevented by caffeinate, powerd)\n"],
+    ["dscacheutil", "name: root\npassword: *\nuid: 0\ngid: 0\ndir: /var/root\nshell: /bin/sh\ngecos: System Administrator\n\nname: daemon\npassword: *\nuid: 1\n"],
+    ["plutil", "{\n  \"BuildID\" => \"FFFF\"\n  \"Nested\" => {\n    \"a\" => 1\n  }\n}\n"],
+    ["ethtool", "driver: e1000e\nversion: 3.2.6-k\nfirmware-version: 0.13-4\nbus-info: 0000:00:19.0\n"],
+    ["lscpu extended", "CPU NODE SOCKET CORE L1d:L1i:L2:L3 ONLINE\n0 0 0 0 0:0:0:0 yes\n1 0 0 1 1:1:1:0 yes\n"],
+    ["networkctl list", "IDX LINK TYPE OPERATIONAL SETUP\n  1 lo loopback carrier unmanaged\n  2 eth0 ether routable configured\n\n2 links listed.\n"],
+    ["busctl list", "NAME PID PROCESS USER CONNECTION UNIT SESSION DESCRIPTION\n:1.0 1 systemd root :1.0 init.scope - -\n"],
+    ["systemctl list-sockets", "LISTEN UNIT ACTIVATES\n/run/dbus/system_bus_socket dbus.socket dbus.service\n\n1 sockets listed.\n"],
+    ["systemctl list-jobs", "JOB UNIT TYPE STATE\n  1 foo.service start running\n\n1 jobs listed.\n"],
+    ["resolvectl status", "Global\n       Protocols: -LLMNR -mDNS\nresolv.conf mode: stub\n\nLink 2 (eth0)\n    Current Scopes: DNS\n       DNS Servers: 192.168.1.1\n"],
+    ["systemd-analyze blame", "  4.512s NetworkManager-wait-online.service\n 1min 2.345s snapd.service\n  845ms foo.mount\n"],
+    ["fdisk", "Disk /dev/sda: 100 GiB, 107374182400 bytes, 209715200 sectors\nDisk model: VBOX HARDDISK   \nUnits: sectors of 1 * 512 = 512 bytes\nDisklabel type: gpt\nDisk identifier: 8F5F3A8B-1111-2222-3333-444455556666\n\nDevice       Start       End   Sectors  Size Type\n/dev/sda1     2048      4095      2048    1M BIOS boot\n/dev/sda2     4096   2101247   2097152    1G EFI System\n"]
+  ]
+end
+
+def test_every_signature_fixture_is_detected_as_exactly_its_own_key():
+  let bad = filter(_sig_fixtures(), fn(f): detect(f[1]) != [f[0]];)
+  | assert_eq(map(bad, fn(f): [f[0], detect(f[1])];), [])
+end
+
+def test_every_registry_signature_has_a_fixture():
+  let with_sig = map(filter(_registry(), fn(e): !is_none(e["sig"]);), fn(e): e["key"];)
+  | let covered = map(_sig_fixtures(), fn(f): f[0];)
+  | assert_eq(filter(with_sig, fn(key): !contains(covered, key);), [])
+end
+
+def test_every_signature_fixture_parses_through_its_own_key():
+  let failed = filter(_sig_fixtures(), fn(f): (try: parse_output(f[0], f[1]) catch: "ERR") == "ERR";)
+  | assert_eq(map(failed, fn(f): f[0];), [])
+end
+
+def test_registry_keys_are_unique():
+  let all_keys = map(_registry(), fn(e): e["key"];)
+  | assert_eq(len(all_keys), len(uniq(all_keys)))
+end
+
+def test_signature_is_matched_only_in_the_first_20_lines():
+  let filler19 = join(map(range(18), fn(i): "x";), "\n")
+  | assert_eq(detect(filler19 + "\nPRETTY_NAME=\"a\""), ["os-release"])
+  | assert_eq(detect(filler19 + "\nx\nPRETTY_NAME=\"a\""), [])
+end
+
+def test_parse_output_checks_the_signature_of_the_named_parser():
+  assert_eq(try: parse_output("id", "hello") catch: "error", "error")
+  | assert_eq(try: parse_output("id", "2 packets transmitted, 2 received, 0% packet loss") catch: "error", "error")
+  | assert_eq(parse_output("id", "uid=0(root) gid=0(root)")["user"], "root")
+end
+
+def test_parse_output_accepts_blank_output_for_a_named_parser():
+  assert_eq(parse_output("git stash", ""), [])
+  | assert_eq(parse_output("git remote", "\n"), [])
+end
+
+def test_parse_output_skips_the_check_for_generic_formats():
+  assert_eq(parse_output("wc", "1 3 6 a.txt"), [{"lines": 1, "words": 3, "bytes": 6, "file": "a.txt"}])
+end
+
+def test_parser_key_picks_git_variants_from_arguments():
+  assert_eq(_parser_key("git", ["log", "--oneline", "-5"]), "git log --oneline")
+  | assert_eq(_parser_key("git", ["diff", "--numstat"]), "git diff --numstat")
+  | assert_eq(_parser_key("git", ["diff", "--stat"]), "git diff --stat")
+  | assert_eq(_parser_key("git", ["log"]), "git log")
+  | assert_eq(_parser_key("git", ["blame", "f"]), "git blame")
+end
+
+def test_uptime_signature_does_not_claim_the_w_output():
+  assert_eq(detect("12:34 up 1 day, 2 users, load averages: 1 2 3\nUSER TTY FROM LOGIN@ IDLE WHAT\nalice ttys000 - 09:00 1 -zsh"), ["w"])
+end
+
+def test_ls_signature_refuses_a_listing_with_a_foreign_line():
+  assert_eq(detect("-rw-r--r--  1 a staff 12 Jan  1 12:00 f\nnot an entry"), [])
+end
+
+def test_date_hostname_whoami_parse():
+  assert_eq(date_parse("Sun Sep 20 16:48:49 JST 2026"), {"weekday": "Sun", "month": "Sep", "day": 20, "time": "16:48:49", "timezone": "JST", "year": 2026})
+  | assert_eq(date_parse("nope"), {})
+  | assert_eq(hostname_parse("web-01\n"), {"hostname": "web-01"})
+  | assert_eq(whoami_parse("alice\n"), {"user": "alice"})
+end
+
+def test_stat_parse_bsd_line():
+  let result = stat_parse("16777235 17789871 -rw-r--r-- 1 root wheel 0 230 \"Aug 15 11:07:33 2026\" \"Aug 15 11:07:33 2026\" \"Sep 15 21:14:34 2026\" \"Aug  2 08:15:31 2026\" 4096 8 0 /etc/hosts")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0], {"path": "/etc/hosts", "device": 16777235, "inode": 17789871, "mode": "-rw-r--r--", "links": 1, "owner": "root", "group": "wheel", "rdev": 0, "size": 230, "atime": "Aug 15 11:07:33 2026", "mtime": "Aug 15 11:07:33 2026", "ctime": "Sep 15 21:14:34 2026", "birthtime": "Aug  2 08:15:31 2026", "blksize": 4096, "blocks": 8, "flags": "0"})
+end
+
+def test_stat_parse_gnu_block():
+  let result = stat_parse("  File: /etc/hosts\n  Size: 221       \tBlocks: 8          IO Block: 4096   regular file\nDevice: 801h/2049d\tInode: 131075      Links: 1\nAccess: (0644/-rw-r--r--)  Uid: (    0/    root)   Gid: (    0/    root)\nAccess: 2024-01-01 12:00:00.000000000 +0000\nModify: 2024-01-02 12:00:00.000000000 +0000\nChange: 2024-01-03 12:00:00.000000000 +0000\n Birth: -")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0], {"file": "/etc/hosts", "size": 221, "blocks": 8, "io_block": 4096, "type": "regular file", "device": "801h/2049d", "inode": 131075, "links": 1, "mode": "0644", "permissions": "-rw-r--r--", "uid": 0, "user": "root", "gid": 0, "group": "root", "access": "2024-01-01 12:00:00.000000000 +0000", "modify": "2024-01-02 12:00:00.000000000 +0000", "change": "2024-01-03 12:00:00.000000000 +0000"})
+end
+
+def test_last_parse_macos_linux_and_footer():
+  assert_eq(last_parse("alice  console  Sun Sep 20 12:45   still logged in"), [{"user": "alice", "tty": "console", "login": "Sun Sep 20 12:45", "session": "still logged in"}])
+  | assert_eq(last_parse("alice pts/0 192.168.1.5 Sat Sep 20 11:00 - 11:30 (00:30)"), [{"user": "alice", "tty": "pts/0", "host": "192.168.1.5", "login": "Sat Sep 20 11:00", "session": "- 11:30 (00:30)"}])
+  | assert_eq(last_parse("reboot  time  Sun Sep 20 12:43\n\nwtmp begins Sun Sep  6 09:00"), [{"user": "reboot", "tty": "time", "login": "Sun Sep 20 12:43"}])
+end
+
+def test_route_parse_linux_table():
+  assert_eq(route_parse("Kernel IP routing table\nDestination Gateway Genmask Flags Metric Ref Use Iface\n0.0.0.0 192.168.1.1 0.0.0.0 UG 100 0 0 eth0"), [{"destination": "0.0.0.0", "gateway": "192.168.1.1", "genmask": "0.0.0.0", "flags": "UG", "metric": 100, "ref": 0, "use": 0, "iface": "eth0"}])
+end
+
+def test_zipinfo_parse_skips_header_and_summary():
+  assert_eq(zipinfo_parse("Archive:  z.zip\nZip file size: 310 bytes, number of entries: 1\n-rw-r--r--  3.0 unx        6 tx stor 26-Sep-20 14:38 a b.txt\n1 file, 6 bytes uncompressed, 6 bytes compressed:  0.0%"), [{"permissions": "-rw-r--r--", "version": "3.0", "os": "unx", "size": 6, "flags": "tx", "method": "stor", "date": "26-Sep-20", "time": "14:38", "name": "a b.txt"}])
+end
+
+def test_gzip_list_parse():
+  assert_eq(gzip_list_parse("  compressed  uncompressed  ratio uncompressed_name\n          32           6 -99.9% h.txt"), [{"compressed": 32, "uncompressed": 6, "ratio": "-99.9%", "uncompressed_name": "h.txt"}])
+end
+
+def test_hexdump_parse_skips_markers_and_final_offset():
+  assert_eq(hexdump_parse("00000000  68 65 6c 6c 6f 0a                                 |hello.|\n*\n00000010"), [{"offset": "00000000", "bytes": "68656c6c6f0a", "ascii": "hello."}])
+end
+
+def test_cksum_parse_with_and_without_file():
+  assert_eq(cksum_parse("4294967295 0 empty.txt\n123 4"), [{"checksum": 4294967295, "size": 0, "file": "empty.txt"}, {"checksum": 123, "size": 4}])
+end
+
+def test_tree_parse_depth_and_path():
+  assert_eq(tree_parse(".\n├── src\n│   └── a.rs\n└── README.md\n\n1 directory, 2 files"), [{"name": "src", "depth": 1, "path": "src"}, {"name": "a.rs", "depth": 2, "path": "src/a.rs"}, {"name": "README.md", "depth": 1, "path": "README.md"}])
+end
+
+def test_getconf_parse_both_layouts():
+  assert_eq(getconf_parse("ARG_MAX 2097152\nPATH: /usr/bin\nEMPTY: "), {"ARG_MAX": 2097152, "PATH": "/usr/bin", "EMPTY": ""})
+end
+
+def test_diskutil_list_parse_partitions():
+  assert_eq(diskutil_list_parse("/dev/disk0 (internal, physical):\n   #:                       TYPE NAME                    SIZE       IDENTIFIER\n   0:      GUID_partition_scheme                        *251.0 GB   disk0\n   1:             Apple_APFS_ISC Container disk1         576.7 MB   disk0s1\n\n/dev/disk3 (synthesized):\n   #:                       TYPE NAME                    SIZE       IDENTIFIER\n   0:      APFS Container Scheme -                      +245.1 GB   disk3"), [{"device": "/dev/disk0", "description": "internal, physical", "partitions": [{"index": 0, "type": "GUID_partition_scheme", "name": "", "size": "*251.0 GB", "identifier": "disk0"}, {"index": 1, "type": "Apple_APFS_ISC", "name": "Container disk1", "size": "576.7 MB", "identifier": "disk0s1"}]}, {"device": "/dev/disk3", "description": "synthesized", "partitions": []}])
+end
+
+def test_pmset_csrutil_spctl_parse():
+  assert_eq(pmset_batt_parse("Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1)\t57%; discharging; 5:38 remaining present: true"), {"source": "Battery Power", "batteries": [{"name": "InternalBattery-0", "id": 1, "percent": 57, "state": "discharging", "remaining": "5:38 remaining", "present": true}]})
+  | assert_eq(pmset_batt_parse("Now drawing from 'AC Power'\n -InternalBattery-0 (id=1)\t100%; charged; 0:00 remaining present: true")["batteries"][0]["state"], "charged")
+  | assert_eq(csrutil_parse("System Integrity Protection status: enabled."), {"status": "enabled"})
+  | assert_eq(spctl_parse("assessments disabled"), {"assessments": "disabled"})
+end
+
+def test_memory_pressure_parse():
+  assert_eq(memory_pressure_parse("The system has 8589934592 (524288 pages with a page size of 16384).\n\nStats: \nPages free: 4435 \nSwap I/O:\nSwapins: 10 "), {"memory_bytes": 8589934592, "pages": 524288, "page_size": 16384, "pages_free": 4435, "swapins": 10})
+end
+
+def test_lsattr_findmnt_swapon_parse():
+  assert_eq(lsattr_parse("--------------e------- ./a.txt"), [{"attributes": "--------------e-------", "path": "./a.txt"}])
+  | assert_eq(findmnt_parse("TARGET SOURCE FSTYPE OPTIONS\n/ /dev/sda1 ext4 rw,relatime\n├─/sys sysfs sysfs rw"), [{"target": "/", "source": "/dev/sda1", "fstype": "ext4", "options": "rw,relatime"}, {"target": "/sys", "source": "sysfs", "fstype": "sysfs", "options": "rw"}])
+  | assert_eq(swapon_parse("NAME TYPE SIZE USED PRIO\n/swapfile file 2G 0B -2"), [{"name": "/swapfile", "type": "file", "size": "2G", "used": "0B", "prio": -2}])
+end
+
+def test_getfacl_parse_blocks():
+  assert_eq(getfacl_parse("# file: a\n# owner: root\n# group: root\nuser::rw-\nother::r--\n\n# file: b\nuser::rwx"), [{"file": "a", "entries": ["user::rw-", "other::r--"], "owner": "root", "group": "root"}, {"file": "b", "entries": ["user::rwx"]}])
+end
+
+def test_getcap_parse_both_separators():
+  assert_eq(getcap_parse("/usr/bin/ping cap_net_raw=ep\n/usr/bin/x = cap_chown+ep"), [{"path": "/usr/bin/ping", "capabilities": "cap_net_raw=ep"}, {"path": "/usr/bin/x", "capabilities": "cap_chown+ep"}])
+end
+
+def test_host_parse_record_types():
+  assert_eq(host_parse("example.com has address 93.184.216.34\nexample.com has IPv6 address 2606:2800::1\nwww.example.com is an alias for example.com.\nexample.com mail is handled by 10 mail.example.com.\nexample.com descriptive text \"v=spf1 -all\"\nexample.com name server a.iana-servers.net.\n34.216.184.93.in-addr.arpa domain name pointer example.com."), [{"name": "example.com", "type": "A", "value": "93.184.216.34"}, {"name": "example.com", "type": "AAAA", "value": "2606:2800::1"}, {"name": "www.example.com", "type": "CNAME", "value": "example.com."}, {"name": "example.com", "type": "MX", "value": "mail.example.com.", "priority": 10}, {"name": "example.com", "type": "TXT", "value": "v=spf1 -all"}, {"name": "example.com", "type": "NS", "value": "a.iana-servers.net."}, {"name": "34.216.184.93.in-addr.arpa", "type": "PTR", "value": "example.com."}])
+end
+
+def test_nslookup_parse_server_and_answers():
+  assert_eq(nslookup_parse("Server:\t8.8.8.8\nAddress:\t8.8.8.8#53\n\nNon-authoritative answer:\nName:\texample.com\nAddress: 93.184.216.34\nName:\texample.org\nAddress: 1.1.1.1\nAddress: 1.1.1.2"), {"server": "8.8.8.8", "server_address": "8.8.8.8#53", "answers": [{"name": "example.com", "addresses": ["93.184.216.34"]}, {"name": "example.org", "addresses": ["1.1.1.1", "1.1.1.2"]}]})
+end
+
+def test_loginctl_lsns_lslocks_lsmem_lslogins_parse():
+  assert_eq(loginctl_parse("SESSION UID USER SEAT TTY\n      1 1000 alice seat0 tty1\n\n1 sessions listed."), [{"session": "1", "uid": 1000, "user": "alice", "seat": "seat0", "tty": "tty1"}])
+  | assert_eq(lsns_parse("        NS TYPE   NPROCS PID USER COMMAND\n4026531835 cgroup    120   1 root /sbin/init"), [{"ns": "4026531835", "type": "cgroup", "nprocs": 120, "pid": 1, "user": "root", "command": "/sbin/init"}])
+  | assert_eq(lslocks_parse("COMMAND PID TYPE SIZE MODE M START END PATH\nsshd 812 FLOCK 0B WRITE 0 0 0 /run/sshd.pid")[0]["pid"], 812)
+  | assert_eq(lsmem_parse("RANGE SIZE STATE REMOVABLE BLOCK\n0x0-0x7fffffff 2G online yes 0-15\n\nMemory block size: 128M"), [{"range": "0x0-0x7fffffff", "size": "2G", "state": "online", "removable": "yes", "block": "0-15"}])
+  | assert_eq(lslogins_parse("UID USER PROC PWD-LOCK PWD-DENY LAST-LOGIN GECOS\n0 root 120 0 0 2026-09-20T12:00:00 root")[0]["proc"], 120)
+end
+
+def test_rpm_qa_and_apt_cache_parse():
+  assert_eq(rpm_qa_parse("bash-5.2.15-3.fc39.x86_64\nperl-libs-4_5.38.0-500.fc39.aarch64"), [{"name": "bash", "version": "5.2.15", "release": "3.fc39", "arch": "x86_64"}, {"name": "perl-libs", "version": "4_5.38.0", "release": "500.fc39", "arch": "aarch64"}])
+  | assert_eq(apt_cache_madison_parse("      curl |   7.81.0-1ubuntu1 | http://archive.ubuntu.com/ubuntu jammy/main amd64 Packages"), [{"package": "curl", "version": "7.81.0-1ubuntu1", "source": "http://archive.ubuntu.com/ubuntu jammy/main amd64 Packages"}])
+  | assert_eq(apt_cache_search_parse("curl - command line tool for transferring data\nlibcurl4 - easy-to-use client-side URL transfer library"), [{"package": "curl", "description": "command line tool for transferring data"}, {"package": "libcurl4", "description": "easy-to-use client-side URL transfer library"}])
+end
+
+def test_dpkg_status_parse_drops_continuation_lines():
+  assert_eq(dpkg_status_parse("Package: curl\nStatus: install ok installed\nDescription: tool: for data\n more text: here\n\nPackage: git\nVersion: 2.34"), [{"Package": "curl", "Status": "install ok installed", "Description": "tool: for data"}, {"Package": "git", "Version": "2.34"}])
+end
+
+def test_ulimit_parse_units_and_unlimited():
+  assert_eq(ulimit_parse("core file size          (blocks, -c) 0\nopen files                      (-n) 256\ncpu time               (seconds, -t) unlimited"), [{"name": "core file size", "flag": "-c", "value": 0, "unit": "blocks"}, {"name": "open files", "flag": "-n", "value": 256}, {"name": "cpu time", "flag": "-t", "value": "unlimited", "unit": "seconds"}])
+end
+
+def test_parser_key_for_new_commands():
+  assert_eq(_parser_key("dpkg-query", ["-s", "curl"]), "dpkg status")
+  | assert_eq(_parser_key("dpkg", ["-l"]), "dpkg")
+  | assert_eq(_parser_key("route", ["-n", "get", "default"]), "route get")
+  | assert_eq(_parser_key("pmset", ["-g", "batt"]), "pmset batt")
+  | assert_eq(_parser_key("diskutil", ["list"]), "diskutil list")
+  | assert_eq(_parser_key("nmcli", ["c"]), "nmcli c")
+  | assert_eq(parse_output("nmcli c", "NAME   UUID   TYPE       DEVICE\nx      aaaa   ethernet   eth0")[0]["NAME"], "x")
+  | assert_eq(parse_output("sha384sum", "d41d8cd98f00b204e9800998ecf8427ed41d8cd98f00b204e9800998ecf8427ed41d8cd98f00b204e9800998ecf8427e  a")[0]["file"], "a")
+end
+
+def test_definition_only_commands():
+  assert_eq(parse_output("chage", "Last password change\t\t\t\t\t: Sep 20, 2026\nPassword expires\t\t\t\t\t: never"), {"Last password change": "Sep 20, 2026", "Password expires": "never"})
+  | assert_eq(parse_output("apt-config dump", "APT::Architecture \"amd64\";\nDir::State::lists \"\";"), [{"key": "APT::Architecture", "value": "amd64"}, {"key": "Dir::State::lists", "value": ""}])
+  | assert_eq(parse_output("debconf-show", "* tzdata/Areas: Asia\n  tzdata/Zones/Asia: Tokyo"), [{"seen": true, "name": "tzdata/Areas", "value": "Asia"}, {"seen": false, "name": "tzdata/Zones/Asia", "value": "Tokyo"}])
+  | assert_eq(parse_output("getent hosts", "127.0.0.1       localhost\n::1             localhost ip6-localhost ip6-loopback"), [{"ip": "127.0.0.1", "hostname": "localhost", "aliases": []}, {"ip": "::1", "hostname": "localhost", "aliases": ["ip6-localhost", "ip6-loopback"]}])
+  | assert_eq(parse_output("nstat", "#kernel\nIpInReceives                  12345              0.0\nTcpRetransSegs   7   0.5"), [{"name": "IpInReceives", "value": 12345, "rate": 0}, {"name": "TcpRetransSegs", "value": 7, "rate": 0.5}])
+  | assert_eq(parse_output("ionice", "best-effort: prio 4"), {"class": "best-effort", "priority": 4})
+  | assert_eq(parse_output("ionice", "idle"), {"class": "idle"})
+  | assert_eq(parse_output("pmap", "1234:   /usr/bin/bash\n0000000000400000    132K r-x-- bash\n0000000000621000      4K r---- bash\n total     2048K"), [{"address": "0000000000400000", "size_kb": 132, "permissions": "r-x--", "mapping": "bash"}, {"address": "0000000000621000", "size_kb": 4, "permissions": "r----", "mapping": "bash"}])
+  | assert_eq(parse_output("systemd-path", "temporary: /tmp\nsystem-binaries: /usr/bin"), {"temporary": "/tmp", "system-binaries": "/usr/bin"})
+  | assert_eq(parse_output("bluetoothctl show", "Controller AA:BB:CC:DD:EE:FF (public)\n\tName: host\n\tPowered: yes"), {"Name": "host", "Powered": "yes"})
+end
+
+def test_uuidparse_definition_keeps_the_time_with_spaces():
+  let rows = parse_output("uuidparse", "UUID                                 VARIANT   TYPE       TIME\n0c65d8cf-2f5d-11ee-be56-0242ac120002 DCE       time-based 2023-07-28 10:00:00,123456+00:00")
+  | assert_eq(rows, [{"uuid": "0c65d8cf-2f5d-11ee-be56-0242ac120002", "variant": "DCE", "type": "time-based", "time": "2023-07-28 10:00:00,123456+00:00"}])
+end
+
+def test_engine_field_rules():
+  let spec = {"type": "regex", "patterns": ["^(?<a>\\S+) (?<b>\\S+) (?<c>\\S+) (?<d>\\S+)$"]}
+  | let fields = {"a": {"type": "int", "null_if": ["-"]}, "b": {"type": "bool", "true_values": ["yes"], "false_values": ["no"], "rename": "flag"}, "c": {"type": "array", "split": ","}, "d": {"trim_suffix": "%", "type": "int"}}
+  | assert_eq(_run_spec(spec, fields, "5 yes x,y 40%\n- no z 7"), [{"a": 5, "flag": true, "c": ["x", "y"], "d": 40}, {"a": None, "flag": false, "c": ["z"], "d": 7}])
+end
+
+def test_engine_wildcard_and_defaults_and_empty_values():
+  assert_eq(_run_spec({"type": "regex", "patterns": ["^(?<a>\\d+) (?<b>\\d*)$"]}, {"*": {"type": "int"}, "c": {"default": "none"}}, "1 2\n3 "), [{"a": 1, "b": 2, "c": "none"}, {"a": 3, "c": "none"}])
+  | assert_eq(_run_spec({"type": "regex", "keep_empty": true, "patterns": ["^(?<a>\\d+) (?<b>\\d*)$"]}, {}, "3 "), [{"a": "3", "b": ""}])
+end
+
+def test_engine_input_options():
+  let text = "junk\nHDR A B\n1 2\n\nfooter"
+  | assert_eq(_run_spec({"type": "columns", "start_at": "^HDR", "until_blank": true}, {"*": {"type": "int"}}, text), [{"hdr": 1, "a": 2, "b": ""}])
+  | assert_eq(_run_spec({"type": "columns", "replace": [["X", "Y"]], "skip": ["^#"]}, {}, "A B\n# c\nX 1"), [{"a": "Y", "b": "1"}])
+  | assert_eq(_run_spec({"type": "columns", "header": false, "headers": ["p", "q"]}, {}, "1 2\n3 4"), [{"p": "1", "q": "2"}, {"p": "3", "q": "4"}])
+end
+
+def test_engine_unknown_spec_type_is_an_error():
+  assert_eq(try: _run_spec({"type": "nope"}, {}, "x") catch: "error", "error")
+end
+
+def test_every_registry_entry_has_a_spec_or_a_function():
+  let bad = filter(_registry(), fn(e): !is_dict(e["parse"]) && !has(e, "parse");)
+  | assert_eq(len(bad), 0)
+end
+
+def test_indent_spec_builds_nested_dicts():
+  assert_eq(_run_spec({"type": "indent"}, {}, "A:\n  B: 1\n  C:\n    D: 2\n  E: 3\nF: 4"), {"A": {"B": "1", "C": {"D": "2"}, "E": "3"}, "F": "4"})
+end
+
+def test_indent_spec_header_without_separator_is_a_section():
+  assert_eq(_run_spec({"type": "indent"}, {}, "resolver #1\n  nameserver[0] : 8.8.8.8\n  flags    : Request A records\nresolver #2\n  nameserver[0] : 1.1.1.1"), {"resolver #1": {"nameserver[0]": "8.8.8.8", "flags": "Request A records"}, "resolver #2": {"nameserver[0]": "1.1.1.1"}})
+end
+
+def test_indent_spec_splits_on_the_first_separator_and_skips_blank_lines():
+  assert_eq(_run_spec({"type": "indent"}, {}, "Hardware:\n\n    Overview:\n\n      UUID: 78F1-B2E: x\n      Cores: 6 (2 P and 4 E)"), {"Hardware": {"Overview": {"UUID": "78F1-B2E: x", "Cores": "6 (2 P and 4 E)"}}})
+  | assert_eq(_run_spec({"type": "indent"}, {}, ""), {})
+end
+
+def test_indent_spec_normalizes_keys_on_request():
+  assert_eq(_run_spec({"type": "indent", "normalize_keys": true}, {}, "Hardware Overview:\n  Model Name: X"), {"hardware_overview": {"model_name": "X"}})
+end
+
+def test_system_profiler_definition():
+  let text = "Hardware:\n\n    Hardware Overview:\n\n      Model Name: MacBook Neo\n      Memory: 8 GB\n      Hardware UUID: 78F15B2E-F525-5F8D-B130-15736E5833F2\n\n"
+  | assert_eq(parse_output("system_profiler", text), {"Hardware": {"Hardware Overview": {"Model Name": "MacBook Neo", "Memory": "8 GB", "Hardware UUID": "78F15B2E-F525-5F8D-B130-15736E5833F2"}}})
+  | assert_eq(detect(text), ["system_profiler"])
+end
+
+def test_record_spec_merges_patterns_and_requires_keys():
+  let spec = {"type": "record", "require": ["a"], "patterns": ["a=(?<a>\\d+)", "b=(?<b>\\d+)"]}
+  | assert_eq(_run_spec(spec, {"*": {"type": "int"}}, "b=2\na=1"), {"a": 1, "b": 2})
+  | assert_eq(_run_spec(spec, {}, "b=2"), {})
+end
+
+def test_map_spec_builds_one_dict_from_rows():
+  let spec = {"type": "regex", "as": "map", "normalize_keys": true, "patterns": ["^(?<key>[^=]+)=(?<value>.*)$"]}
+  | assert_eq(_run_spec(spec, {"*": {"type": "int"}}, "Pages Free=10\nNote=x"), {"pages_free": 10, "note": "x"})
+end
+
+def test_blocks_spec_collects_captures_per_block():
+  let spec = {"type": "blocks", "start": "^\\[", "require": ["name"], "captures": [{"re": "^\\[(?<name>\\w+)\\]"}, {"re": "(?m)^id=(?<id>\\d+)$"}, {"re": "(?m)^tag=(?<value>\\S+)$", "all": true, "values": true, "into": "tags"}, {"re": "(?m)^p (?<a>\\d+) (?<b>\\w+)$", "all": true, "into": "pairs", "fields": {"a": {"type": "int"}}}]}
+  | assert_eq(_run_spec(spec, {"id": {"type": "int"}}, "junk\n[x]\nid=1\ntag=a\ntag=b\np 1 u\np 2 v\n[y]\nid=2"), [{"name": "x", "id": 1, "tags": ["a", "b"], "pairs": [{"a": 1, "b": "u"}, {"a": 2, "b": "v"}]}, {"name": "y", "id": 2, "tags": [], "pairs": []}])
+end
+
+def test_blocks_spec_drops_blocks_missing_a_required_key():
+  let spec = {"type": "blocks", "start": "^\\S", "require": ["name"], "captures": [{"re": "^(?<name>a\\d)"}]}
+  | assert_eq(_run_spec(spec, {}, "a1\n  x\nzzz\n  y\na2"), [{"name": "a1"}, {"name": "a2"}])
+end
+
+def test_capture_join_makes_a_trimmed_string():
+  let spec = {"type": "record", "captures": [{"re": "(?m)^ {2}(?<value>.*)$", "all": true, "values": true, "into": "text", "join": "\n", "trim": true}]}
+  | assert_eq(_run_spec(spec, {}, "head\n  one\n  \n  two\n"), {"text": "one\n\ntwo"})
+end
+
+def test_choice_spec_picks_the_first_matching_option():
+  let spec = {"type": "choice", "options": [{"when": "\\AA", "parse": {"type": "kv", "separator": "="}}, {"parse": {"type": "kv", "separator": ":"}}]}
+  | assert_eq(_run_spec(spec, {}, "A=1"), {"A": "1"})
+  | assert_eq(_run_spec(spec, {}, "B:2"), {"B": "2"})
+end
+
+def test_choice_spec_without_a_matching_option_gives_an_empty_array():
+  assert_eq(_run_spec({"type": "choice", "options": [{"when": "\\AA", "parse": {"type": "kv"}}]}, {}, "B"), [])
+end
+
+def test_kv_blocks_honor_skip_and_replace():
+  assert_eq(_run_spec({"type": "kv", "blocks": true, "skip": ["^ "]}, {}, "a: 1\n cont: x\n\nb: 2"), [{"a": "1"}, {"b": "2"}])
+  | assert_eq(_run_spec({"type": "kv", "blocks": true, "replace": [["\\n---\\n", "\n\n"]]}, {}, "a: 1\n---\nb: 2"), [{"a": "1"}, {"b": "2"}])
+end
+
+def test_trim_field_rule():
+  assert_eq(_run_spec({"type": "regex", "patterns": ["^(?<a>.*)$"]}, {"a": {"trim": true}}, "  x  "), [{"a": "x"}])
+end
+
+def test_ifconfig_empty_flags_give_an_empty_array():
+  assert_eq(ifconfig_parse("stf0: flags=0<> mtu 1280")[0]["flags"], [])
+end
+
+def test_ip_addr_choice_parses_both_layouts_through_one_key():
+  assert_eq(parse_output("ip addr", "lo UNKNOWN 127.0.0.1/8")[0]["addresses"], ["127.0.0.1/8"])
+  | assert_eq(parse_output("ip addr", "1: lo: <LOOPBACK,UP> mtu 65536 qdisc noqueue state UNKNOWN group default\n    inet 127.0.0.1/8 scope host lo")[0]["ipv4"], ["127.0.0.1/8"])
+end
+
+def test_stat_choice_parses_both_layouts_through_one_key():
+  assert_eq(parse_output("stat", "  File: /a\n  Size: 5 \tBlocks: 8          IO Block: 4096   regular file")[0]["file"], "/a")
+  | assert_eq(parse_output("stat", "1 2 -rw-r--r-- 1 root wheel 0 5 \"a\" \"b\" \"c\" \"d\" 4096 8 0 /a")[0]["path"], "/a")
+end
+
+def test_ip_neighbour_definition_and_aliases():
+  assert_eq(parse_output("ip neigh", "192.168.1.1 dev eth0 lladdr 00:11:22:33:44:55 router REACHABLE\n192.168.1.9 dev eth0 FAILED"), [{"address": "192.168.1.1", "dev": "eth0", "lladdr": "00:11:22:33:44:55", "flags": ["router", "REACHABLE"]}, {"address": "192.168.1.9", "dev": "eth0", "flags": ["FAILED"]}])
+  | assert_eq(_parser_key("ip", ["neigh", "show"]), "ip neigh")
+end
+
+def test_words_spec_keys_flags_and_types():
+  let spec = {"type": "words", "first": "name", "prefix_types": ["local"], "keys": ["via", "metric"]}
+  | assert_eq(_run_spec(spec, {"*": {"type": "int"}}, "a via b metric 5 up\nlocal c metric 7"), [{"name": "a", "via": "b", "metric": 5, "flags": ["up"]}, {"name": "c", "metric": 7, "type": "local"}])
+end
+
+def test_lines_spec_trims_and_drops_blank_lines():
+  assert_eq(_run_spec({"type": "lines"}, {}, " a \n\n b\n"), ["a", "b"])
+end
+
+def test_derive_prefix_and_basename_fill_missing_fields_only():
+  let fields = {"kind": {"derive": {"op": "prefix", "from": "perm", "map": {"d": "dir", "-": "file"}, "default": "other"}}, "name": {"derive": {"op": "basename", "from": "path"}}}
+  | assert_eq(_run_spec({"type": "regex", "patterns": ["^(?<perm>\\S+) (?<path>\\S+)(?: (?<name>\\S+))?$"]}, fields, "drwx /a/b\n-rw /c/d given\nlnk /e/f"), [{"perm": "drwx", "path": "/a/b", "kind": "dir", "name": "b"}, {"perm": "-rw", "path": "/c/d", "name": "given", "kind": "file"}, {"perm": "lnk", "path": "/e/f", "kind": "other", "name": "f"}])
+end
+
+def test_squeeze_rule_collapses_whitespace():
+  assert_eq(_run_spec({"type": "regex", "patterns": ["^(?<a>.*)$"]}, {"a": {"squeeze": true}}, "Dec 25    2023"), [{"a": "Dec 25 2023"}])
+end
+
+def test_capture_within_limits_the_text_and_skips_when_absent():
+  let spec = {"type": "record", "captures": [{"within": "groups=(?<value>\\S+)", "re": "(?<id>\\d+)", "all": true, "into": "ids", "fields": {"id": {"type": "int"}}}]}
+  | assert_eq(_run_spec(spec, {}, "uid=5 groups=7,8"), {"ids": [{"id": 7}, {"id": 8}]})
+  | assert_eq(_run_spec(spec, {}, "uid=5"), {})
+end
+
+def test_capture_merge_builds_a_dict_with_normalized_keys():
+  let spec = {"type": "record", "captures": [{"re": "(?<key>[A-Z][A-Za-z]*)=(?<value>\\d+)", "all": true, "merge": true, "into": "d"}, {"re": "(?<key>[A-Z][A-Za-z]*)=(?<value>\\d+)", "all": true, "merge": true}]}
+  | assert_eq(_run_spec(spec, {}, "Foo=1 Bar=2"), {"d": {"foo": "1", "bar": "2"}, "foo": "1", "bar": "2"})
+end
+
+def test_capture_values_with_a_type_become_numbers():
+  assert_eq(_run_spec({"type": "record", "captures": [{"re": "(?<value>[\\d.]+) ms", "all": true, "values": true, "type": "float", "into": "rtts"}]}, {}, "1.5 ms 2 ms"), {"rtts": [1.5, 2]})
+end
+
+def test_nested_blocks_capture_and_last_option():
+  let nested = {"type": "record", "captures": [{"re": "top=(?<top>\\w+)"}, {"into": "items", "blocks": {"type": "blocks", "start": "^item", "require": ["name"], "captures": [{"re": "^item (?<name>\\w+)"}]}}]}
+  | assert_eq(_run_spec(nested, {}, "top=x\nitem a\nitem b"), {"top": "x", "items": [{"name": "a"}, {"name": "b"}]})
+  | assert_eq(_run_spec({"type": "blocks", "start": "^H", "last": true, "captures": [{"re": "^H(?<n>\\d)"}]}, {}, "H1\nH2"), {"n": "2"})
+  | assert_eq(_run_spec({"type": "blocks", "start": "^H", "last": true, "captures": [{"re": "^H(?<n>\\d)"}]}, {}, "none"), {})
+end
+
+def test_ls_definition_derives_type_and_link_target():
+  let rows = ls_parse("drwxr-xr-x   5 alice  staff  160 Dec 25  2023 src\nlrwxr-xr-x   1 alice  staff    5 Jan  1 12:00 ln -> target.txt\nlrwxr-xr-x   1 alice  staff    5 Jan  1 12:00 dangling\ncrw-rw-rw-   1 root   wheel    3 Jan  1 12:00 null")
+  | assert_eq(map(rows, fn(r): r["type"];), ["directory", "symlink", "symlink", "other"])
+  | assert_eq(rows[0]["modified"], "Dec 25 2023")
+  | assert_eq(rows[1]["link_target"], "target.txt")
+  | assert_eq(rows[2]["name"], "dangling")
+end
+
+def test_netstat_routes_macos_sections_and_linux_table():
+  let mac = parse_output("netstat routes", "Routing tables\n\nInternet:\nDestination        Gateway            Flags               Netif Expire\ndefault            100.64.1.1         UGScg                 en0       \n100.64/22          link#5             UCS                   en0      !\n\nInternet6:\nDestination                             Gateway                         Flags               Netif Expire\ndefault                                 fe80::1%en0                     UGcg                  en0       ")
+  | assert_eq(len(mac), 2)
+  | assert_eq(mac[0], {"family": "Internet", "routes": [{"destination": "default", "gateway": "100.64.1.1", "flags": "UGScg", "netif": "en0"}, {"destination": "100.64/22", "gateway": "link#5", "flags": "UCS", "netif": "en0", "expire": "!"}]})
+  | assert_eq(mac[1]["family"], "Internet6")
+  | assert_eq(parse_output("netstat routes", "Kernel IP routing table\nDestination Gateway Genmask Flags MSS Window irtt Iface\n0.0.0.0 192.168.1.1 0.0.0.0 UG 0 0 0 eth0"), [{"destination": "0.0.0.0", "gateway": "192.168.1.1", "genmask": "0.0.0.0", "flags": "UG", "mss": 0, "window": 0, "irtt": 0, "iface": "eth0"}])
+end
+
+def test_networksetup_definitions():
+  assert_eq(parse_output("networksetup -listnetworkserviceorder", "An asterisk (*) denotes that a network service is disabled.\n(1) Wi-Fi\n(Hardware Port: Wi-Fi, Device: en0)\n\n(*) Old VPN\n(Hardware Port: VPN, Device: )\n"), [{"order": 1, "service": "Wi-Fi", "hardware_port": "Wi-Fi", "device": "en0"}, {"order": "*", "service": "Old VPN", "hardware_port": "VPN"}])
+  | assert_eq(parse_output("networksetup -getinfo", "DHCP Configuration\nIP address: 100.64.1.102\nClient ID: \n"), {"IP address": "100.64.1.102", "Client ID": ""})
+  | assert_eq(_parser_key("networksetup", ["-listnetworkserviceorder"]), "networksetup -listnetworkserviceorder")
+  | assert_eq(_parser_key("networksetup", ["-getinfo", "Wi-Fi"]), "networksetup -getinfo")
+  | assert_eq(_parser_key("networksetup", ["-listallhardwareports"]), "networksetup -listallhardwareports")
+end
+
+def test_xxd_lipo_pmset_nvram_dscacheutil_definitions():
+  assert_eq(parse_output("xxd", "00000000: 6865 6c6c 6f20 776f 726c 642c 2074 6869  hello world, thi\n00000010: 0a                                         .")[0], {"offset": "00000000", "bytes": "68656c6c6f20776f726c642c20746869", "ascii": "hello world, thi"})
+  | assert_eq(parse_output("lipo", "Architectures in the fat file: /bin/ls are: x86_64 arm64e arm64e.x1 \n"), {"file": "/bin/ls", "architectures": ["x86_64", "arm64e", "arm64e.x1"]})
+  | assert_eq(parse_output("lipo", "Non-fat file: /a is architecture: arm64\n"), {"file": "/a", "architectures": ["arm64"]})
+  | assert_eq(parse_output("pmset", "System-wide power settings:\nCurrently in use:\n standby              1\n Sleep On Power Button 1\n hibernatefile        /var/vm/sleepimage\n sleep                1 (sleep prevented by caffeinate, powerd)\n"), {"standby": 1, "sleep_on_power_button": 1, "hibernatefile": "/var/vm/sleepimage", "sleep": "1 (sleep prevented by caffeinate, powerd)"})
+  | assert_eq(parse_output("nvram", "auto-boot\ttrue\nboot-args\t-v debug=0x1\n"), {"auto-boot": "true", "boot-args": "-v debug=0x1"})
+  | assert_eq(parse_output("dscacheutil", "name: root\npassword: *\nuid: 0\ngid: 0\n\nname: daemon\npassword: *\nuid: 1\n"), [{"name": "root", "password": "*", "uid": 0, "gid": 0}, {"name": "daemon", "password": "*", "uid": 1}])
+end
+
+def test_plutil_definition_nests_dicts_and_arrays_and_unquotes():
+  assert_eq(parse_output("plutil", "{\n  \"Name\" => \"x\"\n  \"Nested\" => {\n    \"a\" => 1\n    \"b\" => true\n  }\n  \"List\" => [\n    0 => \"p\"\n    1 => \"q\"\n  ]\n}\n"), {"Name": "x", "Nested": {"a": "1", "b": "true"}, "List": {"0": "p", "1": "q"}})
+end
+
+def test_linux_definitions_from_sample_output():
+  assert_eq(parse_output("ethtool", "driver: e1000e\nversion: 3.2.6-k\nbus-info: 0000:00:19.0\n"), {"driver": "e1000e", "version": "3.2.6-k", "bus-info": "0000:00:19.0"})
+  | assert_eq(parse_output("lscpu extended", "CPU NODE SOCKET CORE L1d:L1i:L2:L3 ONLINE\n0 0 0 0 0:0:0:0 yes\n"), [{"cpu": 0, "node": 0, "socket": 0, "core": 0, "l1d_l1i_l2_l3": "0:0:0:0", "online": "yes"}])
+  | assert_eq(_parser_key("lscpu", ["-e"]), "lscpu extended")
+  | assert_eq(parse_output("networkctl list", "IDX LINK TYPE OPERATIONAL SETUP\n  1 lo loopback carrier unmanaged\n\n1 links listed.\n"), [{"idx": 1, "link": "lo", "type": "loopback", "operational": "carrier", "setup": "unmanaged"}])
+  | assert_eq(parse_output("systemctl list-jobs", "JOB UNIT TYPE STATE\n  1 foo.service start running\n\n1 jobs listed.\n"), [{"job": 1, "unit": "foo.service", "type": "start", "state": "running"}])
+  | assert_eq(parse_output("systemctl list-sockets", "LISTEN UNIT ACTIVATES\n/run/dbus/system_bus_socket dbus.socket dbus.service\n\n1 sockets listed.\n"), [{"listen": "/run/dbus/system_bus_socket", "unit": "dbus.socket", "activates": "dbus.service"}])
+  | assert_eq(parse_output("systemctl show", "Id=ssh.service\nActiveState=active\nExecStart={ path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -D }"), {"Id": "ssh.service", "ActiveState": "active", "ExecStart": "{ path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -D }"})
+  | assert_eq(parse_output("resolvectl status", "Global\n       Protocols: -LLMNR -mDNS\nresolv.conf mode: stub\n\nLink 2 (eth0)\n    Current Scopes: DNS\n         Protocols: +DefaultRoute\nCurrent DNS Server: 192.168.1.1\n       DNS Servers: 192.168.1.1\n"), [{"name": "Global", "protocols": "-LLMNR -mDNS", "resolv.conf_mode": "stub"}, {"name": "Link 2 (eth0)", "current_scopes": "DNS", "protocols": "+DefaultRoute", "current_dns_server": "192.168.1.1", "dns_servers": "192.168.1.1"}])
+  | assert_eq(parse_output("systemd-analyze blame", "  4.512s NetworkManager-wait-online.service\n 1min 2.345s snapd.service\n  845ms foo.mount\n"), [{"time": "4.512s", "unit": "NetworkManager-wait-online.service"}, {"time": "1min 2.345s", "unit": "snapd.service"}, {"time": "845ms", "unit": "foo.mount"}])
+end
+
+def test_fdisk_definition_reads_disks_and_partitions():
+  let rows = parse_output("fdisk", "Disk /dev/sda: 100 GiB, 107374182400 bytes, 209715200 sectors\nDisk model: VBOX HARDDISK   \nUnits: sectors of 1 * 512 = 512 bytes\nDisklabel type: gpt\nDisk identifier: 8F5F3A8B-1111\n\nDevice       Start       End   Sectors  Size Type\n/dev/sda1     2048      4095      2048    1M BIOS boot\n/dev/sda2     4096   2101247   2097152    1G EFI System\n\n\nDisk /dev/sdb: 1 GiB, 1073741824 bytes, 2097152 sectors\n")
+  | assert_eq(len(rows), 2)
+  | assert_eq(rows[0]["device"], "/dev/sda")
+  | assert_eq(rows[0]["bytes"], 107374182400)
+  | assert_eq(rows[0]["model"], "VBOX HARDDISK")
+  | assert_eq(rows[0]["label_type"], "gpt")
+  | assert_eq(rows[0]["partitions"], [{"device": "/dev/sda1", "start": 2048, "end": 4095, "sectors": 2048, "size": "1M", "type": "BIOS boot"}, {"device": "/dev/sda2", "start": 4096, "end": 2101247, "sectors": 2097152, "size": "1G", "type": "EFI System"}])
+  | assert_eq(rows[1]["partitions"], [])
+end
+
+def test_engine_indent_unquote_and_blocks_skip():
+  assert_eq(_run_spec({"type": "indent", "separator": " => ", "unquote": true, "skip": ["^[{]$", "^\\s*}$"]}, {}, "{\n  \"a\" => \"b\"\n}"), {"a": "b"})
+  | assert_eq(_run_spec({"type": "blocks", "start": "^X", "skip": ["^#"], "captures": [{"re": "^X(?<n>\\d)"}]}, {}, "X1\n# x\nX2"), [{"n": "1"}, {"n": "2"}])
+end
