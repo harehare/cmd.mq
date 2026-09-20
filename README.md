@@ -48,7 +48,7 @@ mq -L . -I null --allow-run=df -F json 'import "cmd" | cmd::run("df", ["-k"])'
 | Function | Description |
 |---|---|
 | `parse_auto(output)` | Detects the command from the text and parses it. Raises an error when no signature matches or when several do, listing the candidates |
-| `detect(output)` | Returns the keys whose signature fits the first 20 lines of the text. Formats that are too generic to recognize (`wc`, `du`, `git status`, ...) are never returned |
+| `detect(output)` | Returns the keys whose signature fits the inspected input. Generic formats (`wc`, `du`, `git status`, ...) are never returned |
 | `parse_output(key, output)` | Parses `output` with the parser for `key`, e.g. `"ps"`, `"git log"`, `"ip addr"`. Raises an error for an unknown key. Naming a parser is a claim about the text: when the parser has a signature the text must fit it, otherwise an error lists what `detect` finds. Blank output parses to an empty result |
 | `run(cmd, args = [])` | Runs the command with `system` and parses its output. The subcommand picks the parser (`git log`, `docker ps`, `ip addr`). Requires `--allow-run` |
 
@@ -260,7 +260,7 @@ Aliases such as `md5sum`, `shasum`, `rg`, `journalctl`, `printenv`, `pip3`, `yum
 
 ## Auto-detection
 
-`parse_auto` recognizes the output by its text alone. Each parser has a signature: a regular expression (multi-line mode) matched against the first 20 lines of the text. Nothing is guessed:
+`parse_auto` recognizes the output by its text alone. Each parser has a signature: a multi-line regular expression matched against a bounded input prefix. Nothing is guessed:
 
 - If exactly one signature fits, that parser runs.
 - If none fits, or several do, it raises an error. The message lists the candidates, and you name the parser with `parse_output`.
@@ -306,7 +306,7 @@ Most parsers are declared as data. `_registry()` in `cmd.mq` is a list of dicts,
 | Key | Meaning |
 |---|---|
 | `key` | The command, or the command and its subcommand (`git log`, `docker ps`). `run()` builds it from the command line, and `parse_output(key, text)` takes it |
-| `sig` | A regex (multi-line mode) matched against the first 20 lines. It says what the text must look like. Use `None` for a format that is too generic to claim, so that it is only used when named |
+| `sig` | A multi-line regex that says what the text must look like. Use `None` for a format that is too generic to claim, so that it is only used when named |
 | `parse` | A spec dict (below), or a function for a format the engine cannot express |
 | `fields` | Optional rules for the fields the spec produces |
 

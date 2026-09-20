@@ -571,6 +571,21 @@ def test_parse_output_reaches_generic_git_formats_by_name():
   | assert_eq(parse_output("git diff --numstat", "1\t2\ta.rs"), [{"added": 1, "deleted": 2, "path": "a.rs"}])
 end
 
+def test_extended_registry_configs():
+  assert_eq(parse_output("git diff --name-status", "M\tsrc/a.mq"), [{"status": "M", "path": "src/a.mq"}])
+  | assert_eq(parse_output("git diff --shortstat", " 2 files changed, 3 insertions(+), 1 deletion(-)"), {"files_changed": 2, "insertions": 3, "deletions": 1})
+  | assert_eq(parse_output("git cherry", "+ abc1234 add parser"), [{"mark": "+", "commit": "abc1234", "message": "add parser"}])
+  | assert_eq(parse_output("git count-objects", "count: 3\nsize: 12"), {"count": 3, "size": 12})
+  | assert_eq(parse_output("git ls-remote", "abc1234\trefs/heads/main"), [{"commit": "abc1234", "ref": "refs/heads/main"}])
+  | assert_eq(parse_output("cargo search", "mq = \"0.8.5\" # query language"), [{"name": "mq", "version": "0.8.5", "description": "query language"}])
+  | assert_eq(parse_output("go env", "GOOS='darwin'\nGOARCH='arm64'"), {"GOOS": "darwin", "GOARCH": "arm64"})
+  | assert_eq(parse_output("go version", "go version go1.25.0 darwin/arm64"), {"version": "1.25.0", "os": "darwin", "arch": "arm64"})
+  | assert_eq(parse_output("uv pip show", "Name: ruff\nVersion: 0.6.0\n\nName: mq\nVersion: 0.8.5"), [{"Name": "ruff", "Version": "0.6.0"}, {"Name": "mq", "Version": "0.8.5"}])
+  | assert_eq(parse_output("snap services", "Service Startup Current Notes\nlxd.daemon enabled active -")[0]["service"], "lxd.daemon")
+  | assert_eq(parse_output("zfs list", "NAME USED AVAIL REFER MOUNTPOINT\ntank 100G 900G 100G /tank")[0]["name"], "tank")
+  | assert_eq(parse_output("zpool list", "NAME SIZE ALLOC FREE CKPOINT EXPANDSZ FRAG CAP DEDUP HEALTH ALTROOT\ntank 1T 100G 900G - - 10% 9% 1.00x ONLINE -")[0]["health"], "ONLINE")
+end
+
 def _sig_fixtures():
   [
     ["ps", "USER PID %CPU %MEM VSZ RSS TT STAT STARTED TIME COMMAND\nroot 1 0.5 0.1 100 200 ?? Ss 9:00 0:01 /sbin/init"],
@@ -731,7 +746,7 @@ def test_registry_keys_are_unique():
   | assert_eq(len(all_keys), len(uniq(all_keys)))
 end
 
-def test_signature_is_matched_only_in_the_first_20_lines():
+def test_signature_is_matched_within_the_detection_window():
   let filler19 = join(map(range(18), fn(i): "x";), "\n")
   | assert_eq(detect(filler19 + "\nPRETTY_NAME=\"a\""), ["os-release"])
   | assert_eq(detect(filler19 + "\nx\nPRETTY_NAME=\"a\""), [])
@@ -755,6 +770,9 @@ end
 def test_parser_key_picks_git_variants_from_arguments():
   assert_eq(_parser_key("git", ["log", "--oneline", "-5"]), "git log --oneline")
   | assert_eq(_parser_key("git", ["diff", "--numstat"]), "git diff --numstat")
+  | assert_eq(_parser_key("git", ["diff", "--name-status"]), "git diff --name-status")
+  | assert_eq(_parser_key("git", ["diff", "--shortstat"]), "git diff --shortstat")
+  | assert_eq(_parser_key("uv", ["pip", "show", "mq"]), "uv pip show")
   | assert_eq(_parser_key("git", ["diff", "--stat"]), "git diff --stat")
   | assert_eq(_parser_key("git", ["log"]), "git log")
   | assert_eq(_parser_key("git", ["blame", "f"]), "git blame")

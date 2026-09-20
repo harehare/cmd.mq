@@ -2185,11 +2185,7 @@ def _by_key(key, output):
   | if (is_none(entry)): error("cmd: no parser for `" + key + "`") else: _run_entry(entry, output)
 end
 
-# Parser table. Each entry has a `key`, a `sig` regex (multi-line mode,
-# matched against the first 20 lines) that says what the text must look
-# like, and the `parse` function. A `sig` of None means the format is too
-# generic to claim: such an entry is never picked by `detect`, and is used
-# only when named.
+# Parser registry. Entries without a signature are used only when named.
 def _registry():
   [
     {"key": "ps", "sig": "\\A\\s*(?:USER\\s+PID|UID\\s+PID|PID\\s+(?:TTY|TT)\\s)", "parse": {"type": "columns"}, "fields": {"pid": {"type": "int"}, "ppid": {"type": "int"}, "cpu_percent": {"type": "int"}, "mem_percent": {"type": "int"}, "vsz": {"type": "int"}, "rss": {"type": "int"}}},
@@ -2257,10 +2253,19 @@ def _registry():
     {"key": "git branch", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<mark>[*+ ]) (?<name>\\S+)\\s+(?<commit>[0-9a-f]{7,40})\\s+(?<message>.*)$", "^(?<mark>[*+ ]) (?<name>.+?)\\s*$"]}, "fields": {"mark": {"type": "bool", "true_values": ["*"], "false_values": [" ", "+"], "rename": "current"}}},
     {"key": "git diff --numstat", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<added>\\d+|-)\\t(?<deleted>\\d+|-)\\t(?<path>.*)$"]}, "fields": {"added": {"type": "int", "null_if": ["-"]}, "deleted": {"type": "int", "null_if": ["-"]}}},
     {"key": "git diff --stat", "sig": "^ \\d+ files? changed", "parse": git_diff_stat_parse},
+    {"key": "git diff --name-status", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<status>[A-Z][0-9]*)\\t(?<path>.*)$"]}},
+    {"key": "git diff --shortstat", "sig": None, "parse": {"type": "record", "patterns": ["(?<files_changed>\\d+) files? changed", "(?<insertions>\\d+) insertions?\\(\\+\\)", "(?<deletions>\\d+) deletions?\\(-\\)"]}, "fields": {"*": {"type": "int"}}},
     {"key": "git shortlog", "sig": None, "parse": {"type": "regex", "patterns": ["^\\s*(?<commits>\\d+)\\s+(?<author>.*?)(?: <(?<email>[^>]*)>)?$"]}, "fields": {"commits": {"type": "int"}}},
     {"key": "git remote", "sig": _shape("\\S+\\s+\\S+ \\((?:fetch|push)\\)"), "parse": {"type": "regex", "patterns": ["^(?<name>\\S+)\\s+(?<url>\\S+) \\((?<direction>fetch|push)\\)$"]}},
     {"key": "git stash", "sig": _shape("stash@\\{\\d+\\}: [^\\n]*"), "parse": {"type": "regex", "patterns": ["^(?<ref>stash@\\{(?<index>\\d+)\\}): (?:WIP on|On) (?<branch>[^:]+): (?<message>.*)$", "^(?<ref>stash@\\{(?<index>\\d+)\\}): (?<message>.*)$"]}, "fields": {"index": {"type": "int"}}},
     {"key": "git reflog", "sig": _shape("[0-9a-f]{7,40} (?:\\([^)\\n]*\\) )?\\S+@\\{\\d+\\}: [^\\n]*"), "parse": {"type": "regex", "patterns": ["^(?<commit>[0-9a-f]{7,40}) (?:\\([^)]*\\) )?(?<ref>\\S+@\\{\\d+\\}): (?<action>[^:]+)(?:: (?<message>.*))?$"]}},
+    {"key": "git cherry", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<mark>[+-]) (?<commit>[0-9a-f]{7,40}) (?<message>.*)$"]}},
+    {"key": "git clean", "sig": None, "parse": {"type": "regex", "patterns": ["^Would remove (?<path>.*)$"]}},
+    {"key": "git count-objects", "sig": None, "parse": {"type": "kv", "separator": ":"}, "fields": {"*": {"type": "int"}}},
+    {"key": "git ls-files", "sig": None, "parse": {"type": "lines"}},
+    {"key": "git ls-remote", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<commit>[0-9a-f]{7,64})\\t(?<ref>.*)$"]}},
+    {"key": "git show-ref", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<commit>[0-9a-f]{7,64})\\s+(?<ref>.*)$"]}},
+    {"key": "git submodule", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<status>[ +-])?(?<commit>[0-9a-f]{7,40})\\s+(?<path>.*?)(?: \\((?<description>.*)\\))?$"]}},
     {"key": "git worktree", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<path>.+?)\\s+(?<commit>[0-9a-f]{7,40})\\s+(?:\\[(?<branch>[^\\]]+)\\]|\\((?<state>[^)]+)\\))"]}},
     {"key": "git config", "sig": None, "parse": {"type": "kv", "separator": "="}},
     {"key": "pip list", "sig": "\\A\\s*Package\\s+Version", "parse": {"type": "aligned", "offsets": "dashes"}},
@@ -2271,7 +2276,16 @@ def _registry():
     {"key": "brew services", "sig": "\\AName\\s+Status\\s+User\\s+File", "parse": {"type": "columns"}},
     {"key": "gem list", "sig": _shape("\\*\\*\\* LOCAL GEMS \\*\\*\\*|\\S+ \\((?:default: )?\\d[^)\\n]*\\)"), "parse": {"type": "regex", "patterns": ["^(?<name>\\S+) \\((?<versions>.*)\\)$"]}, "fields": {"versions": {"type": "array"}}},
     {"key": "cargo install", "sig": "\\A\\S+ v\\d[^:\\s]*(?: \\([^)\\n]*\\))?:\\n", "parse": {"type": "blocks", "start": "^\\S", "require": ["name"], "captures": [{"re": "^(?<name>\\S+) v(?<version>[^\\s:]+)(?: \\((?<source>[^)]*)\\))?:"}, {"re": "(?m)^\\s+(?<value>\\S.*)$", "all": true, "values": true, "into": "binaries"}]}},
+    {"key": "cargo search", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<name>[-A-Za-z0-9_]+) = \\\"(?<version>[^\\\"]+)\\\"\\s+# (?<description>.*)$"]}},
     {"key": "npm ls", "sig": "^[├└][─┬]+ \\S+@\\S+", "parse": {"type": "tree", "pattern": "^(?<indent>[│ ]*)[├└][─┬]+ (?<name>@?[^@\\s]+)@(?<version>\\S+)", "unit": 2}},
+    {"key": "npm outdated", "sig": None, "parse": {"type": "columns"}},
+    {"key": "go env", "sig": None, "parse": {"type": "kv", "separator": "=", "unquote": true}},
+    {"key": "go list", "sig": None, "parse": {"type": "lines"}},
+    {"key": "go mod", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<from>\\S+)\\s+(?<to>\\S+)$"]}},
+    {"key": "go version", "sig": None, "parse": {"type": "regex", "single": true, "patterns": ["^go version go(?<version>\\S+) (?<os>\\S+)/(?<arch>\\S+).*$"]}},
+    {"key": "uv pip show", "sig": None, "parse": {"type": "kv", "blocks": true, "separator": ":"}},
+    {"key": "uv python", "sig": None, "parse": {"type": "columns"}},
+    {"key": "uv tool", "sig": None, "parse": {"type": "blocks", "start": "^\\S+ v", "require": ["name"], "captures": [{"re": "^(?<name>\\S+) v(?<version>[^\\s]+)"}, {"re": "(?m)^- (?<value>.*)$", "all": true, "values": true, "into": "tools"}]}},
     {"key": "dpkg", "sig": "^\\|\\|/ Name\\s+Version", "parse": {"type": "regex", "patterns": ["^(?<status>[a-zA-Z]{2,3})\\s+(?<name>\\S+)\\s+(?<version>\\S+)\\s+(?<architecture>\\S+)\\s+(?<description>.*)$"]}},
     {"key": "apt list", "sig": _shape("Listing\\.\\.\\.[^\\n]*|[a-z0-9][a-z0-9+.-]*/[a-z0-9,.-]+ \\d\\S* [a-z0-9]+(?: \\[[^\\]\\n]*\\])?"), "parse": {"type": "regex", "patterns": ["^(?<name>[^/\\s]+)/(?<suite>\\S+) (?<version>\\S+) (?<architecture>\\S+)(?: \\[(?<status>[^\\]]*)\\])?$"]}},
     {"key": "dnf list", "sig": "^(?:Installed|Available) Packages", "parse": {"type": "regex", "patterns": ["^(?<name>\\S+)\\.(?<architecture>[A-Za-z0-9_]+)\\s+(?<version>\\S+)\\s+(?<repo>\\S+)$"], "trim": true}},
@@ -2284,8 +2298,22 @@ def _registry():
     {"key": "docker stats", "sig": "\\ACONTAINER ID\\s+NAME\\s+CPU %", "parse": {"type": "aligned", "keys": "raw"}},
     {"key": "docker volume", "sig": "\\ADRIVER\\s+VOLUME NAME", "parse": {"type": "aligned", "keys": "raw"}},
     {"key": "docker network", "sig": "\\ANETWORK ID\\s+NAME\\s+DRIVER", "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "docker context", "sig": None, "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "docker buildx", "sig": None, "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "docker system", "sig": None, "parse": {"type": "columns"}},
     {"key": "kubectl get", "sig": "\\A(?:NAMESPACE\\s+)?NAME\\s+(?:READY|TYPE\\s+CLUSTER-IP|STATUS|DESIRED|CLUSTER-IP|CAPACITY)\\s+", "parse": {"type": "aligned", "keys": "raw"}},
     {"key": "kubectl top", "sig": "\\A(?:NAMESPACE\\s+)?NAME\\s+CPU\\(cores\\)", "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "kubectl api-resources", "sig": None, "parse": {"type": "columns"}},
+    {"key": "kubectl config", "sig": None, "parse": {"type": "aligned", "keys": "raw", "replace": [["(?m)^\\*", " "]]}},
+    {"key": "gh issue", "sig": None, "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "gh pr", "sig": None, "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "gh release", "sig": None, "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "gh repo", "sig": None, "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "gh run", "sig": None, "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "gh workflow", "sig": None, "parse": {"type": "aligned", "keys": "raw"}},
+    {"key": "snap services", "sig": None, "parse": {"type": "columns"}},
+    {"key": "zfs list", "sig": None, "parse": {"type": "columns"}},
+    {"key": "zpool list", "sig": None, "parse": {"type": "columns"}},
     {"key": "date", "sig": "\\A\\w{3} \\w{3}\\s+\\d{1,2} \\d{2}:\\d{2}:\\d{2} \\S+ \\d{4}\\n*\\z", "parse": {"type": "regex", "single": true, "patterns": ["^(?<weekday>\\w{3}) (?<month>\\w{3})\\s+(?<day>\\d{1,2}) (?<time>\\d{2}:\\d{2}:\\d{2}) (?<timezone>\\S+) (?<year>\\d{4})$"], "trim": true}, "fields": {"day": {"type": "int"}, "year": {"type": "int"}}},
     {"key": "hostname", "sig": None, "parse": {"type": "regex", "single": true, "trim": true, "patterns": ["^(?<hostname>.+)$"]}},
     {"key": "whoami", "sig": None, "parse": {"type": "regex", "single": true, "trim": true, "patterns": ["^(?<user>.+)$"]}},
@@ -2420,7 +2448,7 @@ def _parser_key(cmd, args):
   | let value_flags = if (name == "git"): ["-C", "-c"] elif (name == "kubectl"): ["-n", "--namespace", "--context"] else: []
   | let sub = _subcommand(args, value_flags)
   | let with_sub = name + " " + sub
-  | let variant = if (with_sub == "git log" && contains(args, "--oneline")): "git log --oneline" elif (with_sub == "git diff" && contains(args, "--numstat")): "git diff --numstat" elif (with_sub == "git diff" && contains(args, "--stat")): "git diff --stat" elif (name == "dpkg" && (contains(args, "-s") || contains(args, "--status"))): "dpkg status" elif (name == "netstat" && (contains(args, "-r") || contains(args, "-rn") || contains(args, "-nr") || contains(args, "--route"))): "netstat routes" elif (name == "lscpu" && (contains(args, "-e") || contains(args, "--extended"))): "lscpu extended" elif (name == "networksetup" && !is_empty(args)): "networksetup " + args[0] else: with_sub
+  | let variant = if (with_sub == "git log" && contains(args, "--oneline")): "git log --oneline" elif (with_sub == "git diff" && contains(args, "--numstat")): "git diff --numstat" elif (with_sub == "git diff" && contains(args, "--name-status")): "git diff --name-status" elif (with_sub == "git diff" && contains(args, "--shortstat")): "git diff --shortstat" elif (with_sub == "git diff" && contains(args, "--stat")): "git diff --stat" elif (with_sub == "uv pip" && contains(args, "show")): "uv pip show" elif (name == "dpkg" && (contains(args, "-s") || contains(args, "--status"))): "dpkg status" elif (name == "netstat" && (contains(args, "-r") || contains(args, "-rn") || contains(args, "-nr") || contains(args, "--route"))): "netstat routes" elif (name == "lscpu" && (contains(args, "-e") || contains(args, "--extended"))): "lscpu extended" elif (name == "networksetup" && !is_empty(args)): "networksetup " + args[0] else: with_sub
   | if (variant != with_sub && !is_none(_find(variant))): variant
     elif (sub != "" && !is_none(_find(variant))): variant
     elif (!is_none(_find(name))): name
@@ -2428,13 +2456,12 @@ def _parser_key(cmd, args):
     else: name
 end
 
-# Returns the first 20 lines of the text, the window signatures are matched against.
+# Bounds the text inspected by signatures.
 def _window(output):
   join(slice(split(output, "\n"), 0, 20), "\n")
 end
 
-# Returns true when the signature matches the text. The signature is a claim
-# about the whole text (anchored with `\A` and `\z`) or about a line in it.
+# Returns whether a signature matches the text.
 def _fits(output, sig):
   is_regex_match(_window(output), "(?m)" + sig)
 end
@@ -2464,10 +2491,7 @@ def parse_output(key, output):
       _run_entry(entry, output)
 end
 
-# Returns the keys of the parsers whose signature fits the first 20 lines of
-# the output, or an empty array when none does. Formats that are too generic
-# to recognize (`wc`, `du`, `git status`, ...) have no signature and are
-# never returned.
+# Returns the matching parser keys. Generic formats are never returned.
 #
 # Example:
 # ```
