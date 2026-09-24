@@ -2259,6 +2259,7 @@ def _registry():
     {"key": "git diff --numstat", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<added>\\d+|-)\\t(?<deleted>\\d+|-)\\t(?<path>.*)$"]}, "fields": {"added": {"type": "int", "null_if": ["-"]}, "deleted": {"type": "int", "null_if": ["-"]}}},
     {"key": "git diff --stat", "sig": "^ \\d+ files? changed", "parse": git_diff_stat_parse},
     {"key": "git diff --name-status", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<status>[A-Z][0-9]*)\\t(?<path>.*)$"]}},
+    {"key": "git diff --name-only", "sig": None, "parse": {"type": "lines"}},
     {"key": "git diff --shortstat", "sig": None, "parse": {"type": "record", "patterns": ["(?<files_changed>\\d+) files? changed", "(?<insertions>\\d+) insertions?\\(\\+\\)", "(?<deletions>\\d+) deletions?\\(-\\)"]}, "fields": {"*": {"type": "int"}}},
     {"key": "git shortlog", "sig": None, "parse": {"type": "regex", "patterns": ["^\\s*(?<commits>\\d+)\\s+(?<author>.*?)(?: <(?<email>[^>]*)>)?$"]}, "fields": {"commits": {"type": "int"}}},
     {"key": "git remote", "sig": _shape("\\S+\\s+\\S+ \\((?:fetch|push)\\)"), "parse": {"type": "regex", "patterns": ["^(?<name>\\S+)\\s+(?<url>\\S+) \\((?<direction>fetch|push)\\)$"]}},
@@ -2269,6 +2270,8 @@ def _registry():
     {"key": "git count-objects", "sig": None, "parse": {"type": "kv", "separator": ":"}, "fields": {"*": {"type": "int"}}},
     {"key": "git ls-files", "sig": None, "parse": {"type": "lines"}},
     {"key": "git ls-tree", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<mode>\\d+) (?<type>\\S+) (?<object>[0-9a-f]{7,64})\\t(?<path>.*)$"]}, "fields": {"mode": {"type": "int"}}},
+    {"key": "git tag", "sig": None, "parse": {"type": "lines"}},
+    {"key": "git for-each-ref", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<object>[0-9a-f]{7,64}) (?<type>commit|tag|tree|blob)\\t(?<ref>refs/\\S+)$"]}},
     {"key": "git ls-remote", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<commit>[0-9a-f]{7,64})\\t(?<ref>.*)$"]}},
     {"key": "git show-ref", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<commit>[0-9a-f]{7,64})\\s+(?<ref>.*)$"]}},
     {"key": "git submodule", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<status>[ +-])?(?<commit>[0-9a-f]{7,40})\\s+(?<path>.*?)(?: \\((?<description>.*)\\))?$"]}},
@@ -2453,6 +2456,30 @@ def _subcommand(args, value_flags):
   | if (is_none(st["sub"])): "" else: st["sub"]
 end
 
+# Picks output formats selected by command flags, in precedence order.
+def _flag_variant(with_sub, args):
+  let variants = [
+    {"base": "git log", "flag": "--oneline", "key": "git log --oneline"},
+    {"base": "git diff", "flag": "--numstat", "key": "git diff --numstat"},
+    {"base": "git diff", "flag": "--name-status", "key": "git diff --name-status"},
+    {"base": "git diff", "flag": "--name-only", "key": "git diff --name-only"},
+    {"base": "git diff", "flag": "--shortstat", "key": "git diff --shortstat"},
+    {"base": "git diff", "flag": "--stat", "key": "git diff --stat"},
+    {"base": "uv pip", "flag": "show", "key": "uv pip show"}
+  ]
+  | let matches = filter(variants, fn(v): v["base"] == with_sub && contains(args, v["flag"]);)
+  | if (is_empty(matches)): with_sub else: matches[0]["key"]
+end
+
+# Handles formats selected by options that are not part of a subcommand.
+def _option_variant(name, args, with_sub):
+  if (name == "dpkg" && (contains(args, "-s") || contains(args, "--status"))): "dpkg status"
+  elif (name == "netstat" && (contains(args, "-r") || contains(args, "-rn") || contains(args, "-nr") || contains(args, "--route"))): "netstat routes"
+  elif (name == "lscpu" && (contains(args, "-e") || contains(args, "--extended"))): "lscpu extended"
+  elif (name == "networksetup" && !is_empty(args)): "networksetup " + args[0]
+  else: with_sub
+end
+
 # Returns the parser key for a command, e.g. "git log" or "ps". Tries
 # `name subcommand` (with the git `--oneline`, `--numstat` and `--stat`
 # variants), then `name`, and falls back to the subcommand key so the error
@@ -2463,7 +2490,8 @@ def _parser_key(cmd, args):
   | let value_flags = if (name == "git"): ["-C", "-c"] elif (name == "kubectl"): ["-n", "--namespace", "--context"] else: []
   | let sub = _subcommand(args, value_flags)
   | let with_sub = name + " " + sub
-  | let variant = if (with_sub == "git log" && contains(args, "--oneline")): "git log --oneline" elif (with_sub == "git diff" && contains(args, "--numstat")): "git diff --numstat" elif (with_sub == "git diff" && contains(args, "--name-status")): "git diff --name-status" elif (with_sub == "git diff" && contains(args, "--shortstat")): "git diff --shortstat" elif (with_sub == "git diff" && contains(args, "--stat")): "git diff --stat" elif (with_sub == "uv pip" && contains(args, "show")): "uv pip show" elif (name == "dpkg" && (contains(args, "-s") || contains(args, "--status"))): "dpkg status" elif (name == "netstat" && (contains(args, "-r") || contains(args, "-rn") || contains(args, "-nr") || contains(args, "--route"))): "netstat routes" elif (name == "lscpu" && (contains(args, "-e") || contains(args, "--extended"))): "lscpu extended" elif (name == "networksetup" && !is_empty(args)): "networksetup " + args[0] else: with_sub
+  | let flagged = _flag_variant(with_sub, args)
+  | let variant = if (flagged != with_sub): flagged else: _option_variant(name, args, with_sub)
   | if (variant != with_sub && !is_none(_find(variant))): variant
     elif (sub != "" && !is_none(_find(variant))): variant
     elif (!is_none(_find(name))): name

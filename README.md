@@ -184,6 +184,8 @@ Every function takes the command output as a string. Keys are lowercased header 
 | `git_branch_parse` | `git branch`, `git branch -v` | `name`, `current`, and `commit`, `message` with `-v` |
 | `git_diff_numstat_parse` | `git diff --numstat` | `added`, `deleted` (None for binary), `path` |
 | `git_diff_stat_parse` | `git diff --stat` | `files`, `files_changed`, `insertions`, `deletions` |
+| declared as data only | `git diff --name-only`, `git tag` | Array of path or tag strings |
+| declared as data only | `git for-each-ref` (default format) | `object`, `type`, `ref` per reference |
 | `git_shortlog_parse` | `git shortlog -sn` | `commits`, `author`, `email` |
 | `git_remote_parse` | `git remote -v` | `name`, `url`, `direction` |
 | `git_stash_list_parse` | `git stash list` | `index`, `ref`, `branch`, `message` |
@@ -215,7 +217,7 @@ Every function takes the command output as a string. Keys are lowercased header 
 
 ### Declared as data only
 
-These commands have no `*_parse` function. Reach them with `parse_output`, `run` or `parse_auto`.
+These commands have no `*_parse` function. Reach them with `parse_output` or `run`. `parse_auto` also works when the definition has a signature.
 
 | Command | Output |
 |---|---|
@@ -230,6 +232,8 @@ These commands have no `*_parse` function. Reach them with `parse_output`, `run`
 | `nvram -p` | One dict of the variables |
 | `dscacheutil -q user` | One dict per record. `uid` and `gid` are numbers |
 | `ip neighbour` | `address`, `dev`, `lladdr`, `flags` |
+| `git diff --name-only`, `git tag` | Array of non-blank lines |
+| `git for-each-ref` | `object`, `type`, `ref` from the default output format |
 | `ethtool -i` | One dict of the driver info |
 | `lscpu -e` | One dict per CPU |
 | `fdisk -l` | One dict per disk with `device`, `bytes`, `model`, `label_type`, `identifier` and `partitions` (GPT layout, an MBR `Id` stays in `type`) |
@@ -252,7 +256,7 @@ These commands have no `*_parse` function. Reach them with `parse_output`, `run`
 | Kind | Keys |
 |---|---|
 | Single commands | `ps`, `top`, `pgrep`, `lsof`, `uptime`, `who`, `w`, `id`, `free`, `vmstat`, `vm_stat`, `uname`, `sysctl`, `time`, `launchctl`, `systemctl`, `dmesg`, `syslog`, `df`, `du`, `mount`, `lsblk`, `blkid`, `lsmod`, `lspci`, `lsusb`, `ls`, `tar`, `unzip`, `file`, `checksum`, `wc`, `grep`, `uniq`, `mdls`, `otool`, `ldd`, `ping`, `traceroute`, `ifconfig`, `ss`, `netstat`, `arp`, `dig`, `curl`, `ssh-keygen`, `passwd`, `group`, `hosts`, `os-release`, `locale`, `env`, `sw_vers`, `lscpu`, `hostnamectl`, `timedatectl`, `dpkg`, `pacman`, `lines`, `date`, `hostname`, `whoami`, `stat`, `last`, `route`, `zipinfo`, `gzip`, `hexdump`, `cksum`, `tree`, `getconf`, `csrutil`, `spctl`, `memory_pressure`, `xxd`, `lipo`, `pmset`, `nvram`, `dscacheutil`, `plutil`, `ethtool`, `fdisk`, `lsattr`, `findmnt`, `swapon`, `getfacl`, `getcap`, `host`, `nslookup`, `localectl`, `lsb_release`, `lsns`, `lslocks`, `lsmem`, `lslogins`, `rpm`, `pdfinfo`, `exiftool` |
-| With a subcommand | `ip addr`, `ip route`, `git log`, `git log --oneline`, `git status`, `git branch`, `git diff --numstat`, `git diff --stat`, `git shortlog`, `git remote`, `git stash`, `git reflog`, `git worktree`, `git config`, `pip list`, `pip freeze`, `pip show`, `brew list`, `brew outdated`, `brew services`, `gem list`, `cargo install`, `npm ls`, `apt list`, `dnf list`, `conda list`, `snap list`, `helm list`, `docker ps`, `docker images`, `docker stats`, `docker volume`, `docker network`, `kubectl get`, `kubectl top`, `route get`, `diskutil list`, `diskutil info`, `pmset batt`, `netstat routes`, `networksetup -listallhardwareports`, `networksetup -listnetworkserviceorder`, `networksetup -getinfo`, `lscpu extended`, `networkctl list`, `busctl list`, `systemctl show`, `systemctl list-sockets`, `systemctl list-jobs`, `loginctl show-session`, `loginctl show-user`, `resolvectl status`, `systemd-analyze blame`, `nmcli connection`, `nmcli device`, `loginctl list-sessions`, `loginctl list-users`, `apt-cache madison`, `apt-cache search`, `dpkg status` |
+| With a subcommand | `ip addr`, `ip route`, `git log`, `git log --oneline`, `git status`, `git branch`, `git diff --numstat`, `git diff --stat`, `git diff --name-only`, `git tag`, `git for-each-ref`, `git shortlog`, `git remote`, `git stash`, `git reflog`, `git worktree`, `git config`, `pip list`, `pip freeze`, `pip show`, `brew list`, `brew outdated`, `brew services`, `gem list`, `cargo install`, `npm ls`, `apt list`, `dnf list`, `conda list`, `snap list`, `helm list`, `docker ps`, `docker images`, `docker stats`, `docker volume`, `docker network`, `kubectl get`, `kubectl top`, `route get`, `diskutil list`, `diskutil info`, `pmset batt`, `netstat routes`, `networksetup -listallhardwareports`, `networksetup -listnetworkserviceorder`, `networksetup -getinfo`, `lscpu extended`, `networkctl list`, `busctl list`, `systemctl show`, `systemctl list-sockets`, `systemctl list-jobs`, `loginctl show-session`, `loginctl show-user`, `resolvectl status`, `systemd-analyze blame`, `nmcli connection`, `nmcli device`, `loginctl list-sessions`, `loginctl list-users`, `apt-cache madison`, `apt-cache search`, `dpkg status` |
 
 `chage -l`, `systemd-path`, `bluetoothctl show` (`key: value`), `apt-config dump`, `debconf-show`, `getent hosts`, `uuidparse`, `nstat`, `ionice`, `pmap`, `system_profiler` and `ip neighbour` are declared only as definitions, so they have no `*_parse` function. Use `parse_output`, `run` or `parse_auto`.
 

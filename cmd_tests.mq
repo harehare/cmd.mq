@@ -778,11 +778,20 @@ def test_parser_key_picks_git_variants_from_arguments():
   assert_eq(_parser_key("git", ["log", "--oneline", "-5"]), "git log --oneline")
   | assert_eq(_parser_key("git", ["diff", "--numstat"]), "git diff --numstat")
   | assert_eq(_parser_key("git", ["diff", "--name-status"]), "git diff --name-status")
+  | assert_eq(_parser_key("git", ["diff", "--name-only"]), "git diff --name-only")
   | assert_eq(_parser_key("git", ["diff", "--shortstat"]), "git diff --shortstat")
   | assert_eq(_parser_key("uv", ["pip", "show", "mq"]), "uv pip show")
   | assert_eq(_parser_key("git", ["diff", "--stat"]), "git diff --stat")
   | assert_eq(_parser_key("git", ["log"]), "git log")
+  | assert_eq(_parser_key("git", ["tag", "-l"]), "git tag")
+  | assert_eq(_parser_key("git", ["for-each-ref", "refs/heads"]), "git for-each-ref")
   | assert_eq(_parser_key("git", ["blame", "f"]), "git blame")
+end
+
+def test_added_git_output_formats():
+  assert_eq(parse_output("git diff --name-only", "src/a.mq\nREADME.md\n"), ["src/a.mq", "README.md"])
+  | assert_eq(parse_output("git tag", "v1.0.0\nv1.1.0\n"), ["v1.0.0", "v1.1.0"])
+  | assert_eq(parse_output("git for-each-ref", "abc123456789 commit\trefs/heads/main\ndef123456789 tag\trefs/tags/v1.0.0"), [{"object": "abc123456789", "type": "commit", "ref": "refs/heads/main"}, {"object": "def123456789", "type": "tag", "ref": "refs/tags/v1.0.0"}])
 end
 
 def test_uptime_signature_does_not_claim_the_w_output():
