@@ -643,6 +643,7 @@ def _sig_fixtures():
     ["hostnamectl", "   Static hostname: web\n         Icon name: computer-vm"],
     ["timedatectl", "               Local time: Sat 2026-09-20 12:00:00 JST\n           Universal time: Sat 2026-09-20 03:00:00 UTC"],
     ["git log", "commit abc1234 (HEAD -> main)\nAuthor: A <a@x.dev>\nDate:   Mon Jan 1 12:00:00 2024 +0000\n\n    fix bug\n"],
+    ["git blame --line-porcelain", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\nauthor Alice\nauthor-mail <alice@example.test>\nauthor-time 1700000000\nfilename a.txt\n\tfirst line\n"],
     ["git diff --stat", " src/a.rs | 5 ++---\n 1 file changed, 2 insertions(+), 3 deletions(-)"],
     ["git remote", "origin\thttps://example.com/r.git (fetch)\norigin\thttps://example.com/r.git (push)"],
     ["git stash", "stash@{0}: WIP on main: abc1234 fix bug"],
@@ -800,6 +801,24 @@ def test_added_git_output_formats():
   assert_eq(parse_output("git diff --name-only", "src/a.mq\nREADME.md\n"), ["src/a.mq", "README.md"])
   | assert_eq(parse_output("git tag", "v1.0.0\nv1.1.0\n"), ["v1.0.0", "v1.1.0"])
   | assert_eq(parse_output("git for-each-ref", "abc123456789 commit\trefs/heads/main\ndef123456789 tag\trefs/tags/v1.0.0"), [{"object": "abc123456789", "type": "commit", "ref": "refs/heads/main"}, {"object": "def123456789", "type": "tag", "ref": "refs/tags/v1.0.0"}])
+end
+
+def test_git_blame_line_porcelain_keeps_line_metadata_and_blank_content():
+  let output = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 2\nauthor Alice\nauthor-mail <alice@example.test>\nauthor-time 1700000000\nauthor-tz +0000\ncommitter Alice\ncommitter-mail <alice@example.test>\ncommitter-time 1700000001\ncommitter-tz +0000\nsummary Add file\nboundary\nfilename a file.txt\n\tfirst line\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2 2\nauthor Alice\nfilename a file.txt\n\t\n"
+  | let rows = parse_output("git blame --line-porcelain", output)
+  | assert_eq(len(rows), 2)
+  | assert_eq(rows[0], {"commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "original_line": 1, "final_line": 1, "group_size": 2, "author": "Alice", "author_mail": "alice@example.test", "author_time": 1700000000, "author_tz": "+0000", "committer": "Alice", "committer_mail": "alice@example.test", "committer_time": 1700000001, "committer_tz": "+0000", "summary": "Add file", "boundary": true, "filename": "a file.txt", "content": "first line"})
+  | assert_eq(rows[1]["content"], "")
+  | assert_eq(rows[1]["final_line"], 2)
+  | assert_eq(_parser_key("git", ["blame", "--line-porcelain", "a.txt"]), "git blame --line-porcelain")
+end
+
+def test_gpg_colon_key_records_keep_known_fields_and_ignore_unknown_records():
+  let output = "tru::1:2:3:4:5\npub:u:255:22:ABCDEF0123456789:1700000000:1800000000::u:::scESC:::::ed25519:extra\nfpr:::::::::0123456789ABCDEF0123456789ABCDEF01234567:\nuid:u:::::::HASH:Alice Example <alice@example.test>:\nsub:u:255:18:1234567890ABCDEF:1700000001::::::e:::::cv25519:\nfpr:::::::::89ABCDEF0123456789ABCDEF0123456789ABCDEF:\nfuture:::::::::ignored:"
+  | assert_eq(parse_output("gpg keys", output), [{"record": "pub", "validity": "u", "bits": 255, "algorithm": "22", "key_id": "ABCDEF0123456789", "created": "1700000000", "expires": "1800000000", "ownertrust": "u", "capabilities": "scESC", "curve": "ed25519"}, {"record": "fpr", "fingerprint": "0123456789ABCDEF0123456789ABCDEF01234567"}, {"record": "uid", "validity": "u", "user_id": "Alice Example <alice@example.test>"}, {"record": "sub", "validity": "u", "bits": 255, "algorithm": "18", "key_id": "1234567890ABCDEF", "created": "1700000001", "capabilities": "e", "curve": "cv25519"}, {"record": "fpr", "fingerprint": "89ABCDEF0123456789ABCDEF0123456789ABCDEF"}])
+  | assert_eq(parse_output("gpg --list-keys --with-colons", "sec:u:255:22:ABCDEF0123456789:\nssb:u:255:18:1234567890ABCDEF:"), [{"record": "sec", "validity": "u", "bits": 255, "algorithm": "22", "key_id": "ABCDEF0123456789"}, {"record": "ssb", "validity": "u", "bits": 255, "algorithm": "18", "key_id": "1234567890ABCDEF"}])
+  | assert_eq(_parser_key("gpg", ["--with-colons", "--list-keys"]), "gpg keys")
+  | assert_eq(_parser_key("gpg", ["-K", "--with-colons"]), "gpg keys")
 end
 
 def test_git_inspection_output_formats():

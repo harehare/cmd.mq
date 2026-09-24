@@ -2190,6 +2190,31 @@ def _by_key(key, output):
   | if (is_none(entry)): error("cmd: no parser for `" + key + "`") else: _run_entry(entry, output)
 end
 
+# Reads the stable colon format used by GnuPG key listings. Unknown records
+# and fields are ignored so newer GnuPG versions can add either one.
+def _gpg_colon_row(line):
+  let cols = split(line, ":")
+  | let record = cols[0]
+  | let fields =
+      if (contains(["pub", "sec", "sub", "ssb"], record)):
+        [["validity", 1], ["bits", 2], ["algorithm", 3], ["key_id", 4], ["created", 5], ["expires", 6], ["ownertrust", 8], ["capabilities", 11], ["curve", 16]]
+      elif (record == "uid"): [["validity", 1], ["created", 5], ["expires", 6], ["user_id", 9]]
+      elif (record == "uat"): [["validity", 1], ["created", 5], ["expires", 6], ["attribute", 9]]
+      elif (record == "fpr" || record == "fp2"): [["fingerprint", 9]]
+      elif (record == "grp"): [["keygrip", 9]]
+      else: None
+  | if (is_none(fields)): None
+    else: fold(fields, {"record": record}, fn(acc, field):
+      let value = if (field[1] < len(cols)): cols[field[1]] else: ""
+      | if (value == ""): acc
+        else: set(acc, field[0], if (field[0] == "bits"): _num(value) else: value);
+    )
+end
+
+def _gpg_colons_parse(output):
+  filter(map(_lines(output), _gpg_colon_row), fn(row): !is_none(row);)
+end
+
 # Parser registry. Entries without a signature are used only when named.
 def _registry():
   [
@@ -2280,6 +2305,7 @@ def _registry():
     {"key": "git rev-parse", "sig": None, "parse": {"type": "lines"}},
     {"key": "git describe", "sig": None, "parse": {"type": "regex", "single": true, "patterns": ["^(?<description>[^\\n]+)$"]}},
     {"key": "git check-ignore -v", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<source>.+):(?<line>\\d+):(?<pattern>.*)\\t(?<path>.*)$"]}, "fields": {"line": {"type": "int"}}},
+    {"key": "git blame --line-porcelain", "sig": "\\A\\^?[0-9a-f]{40}(?:[0-9a-f]{24})? \\d+ \\d+(?: \\d+)?\\n", "parse": {"type": "blocks", "start": "^\\^?[0-9a-f]{40}(?:[0-9a-f]{24})? \\d+ \\d+(?: \\d+)?$", "require": ["commit", "content"], "captures": [{"re": "(?m)^\\^?(?<commit>[0-9a-f]{40}(?:[0-9a-f]{24})?) (?<original_line>\\d+) (?<final_line>\\d+)(?: (?<group_size>\\d+))?$"}, {"re": "(?m)^author (?<author>.*)$"}, {"re": "(?m)^author-mail <(?<author_mail>.*)>$"}, {"re": "(?m)^author-time (?<author_time>\\d+)$"}, {"re": "(?m)^author-tz (?<author_tz>.*)$"}, {"re": "(?m)^committer (?<committer>.*)$"}, {"re": "(?m)^committer-mail <(?<committer_mail>.*)>$"}, {"re": "(?m)^committer-time (?<committer_time>\\d+)$"}, {"re": "(?m)^committer-tz (?<committer_tz>.*)$"}, {"re": "(?m)^summary (?<summary>.*)$"}, {"re": "(?m)^filename (?<filename>.*)$"}, {"re": "(?m)^previous (?<previous>.*)$"}, {"re": "(?m)^(?<boundary>boundary)$"}, {"re": "(?m)^\\t(?<content>[^\\n]*)$"}]}, "fields": {"original_line": {"type": "int"}, "final_line": {"type": "int"}, "group_size": {"type": "int"}, "author_time": {"type": "int"}, "committer_time": {"type": "int"}, "boundary": {"type": "bool", "true_values": ["boundary"]}, "content": {"keep_empty": true}}},
     {"key": "git ls-remote", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<commit>[0-9a-f]{7,64})\\t(?<ref>.*)$"]}},
     {"key": "git show-ref", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<commit>[0-9a-f]{7,64})\\s+(?<ref>.*)$"]}},
     {"key": "git submodule", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<status>[ +-])?(?<commit>[0-9a-f]{7,40})\\s+(?<path>.*?)(?: \\((?<description>.*)\\))?$"]}},
@@ -2292,6 +2318,7 @@ def _registry():
     {"key": "rustup component list", "sig": None, "parse": _rustup_items(), "fields": {"installed": {"type": "bool", "true_values": ["installed"], "default": false}}},
     {"key": "ssh-add -L", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<type>(?:ssh|ecdsa|sk)-\\S+)\\s+(?<key>[A-Za-z0-9+/=]+)(?:\\s+(?<comment>.*))?$"]}},
     {"key": "ssh-keyscan", "sig": None, "parse": {"type": "regex", "skip": ["^#"], "patterns": ["^(?<host>\\S+)\\s+(?<type>(?:ssh|ecdsa|sk)-\\S+)\\s+(?<key>[A-Za-z0-9+/=]+)$"]}},
+    {"key": "gpg keys", "sig": None, "parse": _gpg_colons_parse},
     {"key": "rsync stats", "sig": None, "parse": {"type": "regex", "as": "map", "normalize_keys": true, "start_at": "^Number of files:", "patterns": ["^(?<key>[A-Za-z][A-Za-z ]+):\\s*(?<value>.+)$"]}},
     {"key": "mise ls", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<tool>\\S+)\\s+(?<version>\\S+)\\s+\\((?<installed>missing)\\)\\s+(?<source>\\S+)(?:\\s+(?<requested>\\S+))?$", "^(?<tool>\\S+)\\s+(?<version>\\S+)\\s+(?<source>\\S+)(?:\\s+(?<requested>\\S+))?$", "^(?<tool>\\S+)\\s+(?<version>\\S+)$"]}, "fields": {"installed": {"type": "bool", "false_values": ["missing"], "default": true}}},
     {"key": "taskset", "sig": "\\Apid \\d+'s (?:current|new) affinity (?:mask|list): [^\\n]+\\n*\\z", "parse": {"type": "regex", "single": true, "patterns": ["^pid (?<pid>\\d+)'s (?<state>current|new) affinity (?<format>mask|list): (?<affinity>\\S+)$"]}, "fields": {"pid": {"type": "int"}}},
@@ -2464,7 +2491,8 @@ def _key_aliases():
     "nmcli con": "nmcli connection", "nmcli c": "nmcli connection", "nmcli dev": "nmcli device", "nmcli d": "nmcli device",
     "localectl status": "localectl", "lsb_release a": "lsb_release",
     "ip neigh": "ip neighbour", "ip neighbor": "ip neighbour", "ip n": "ip neighbour",
-    "pkgconf list": "pkg-config list", "pkgconf version": "pkg-config version", "ssh-add -l": "ssh-keygen"
+    "pkgconf list": "pkg-config list", "pkgconf version": "pkg-config version", "ssh-add -l": "ssh-keygen",
+    "gpg --list-keys --with-colons": "gpg keys", "gpg --list-secret-keys --with-colons": "gpg keys"
   }
 end
 
@@ -2501,6 +2529,7 @@ def _flag_variant(with_sub, args):
     {"base": "git diff", "flag": "--stat", "key": "git diff --stat"},
     {"base": "git check-ignore", "flag": "-v", "key": "git check-ignore -v"},
     {"base": "git check-ignore", "flag": "--verbose", "key": "git check-ignore -v"},
+    {"base": "git blame", "flag": "--line-porcelain", "key": "git blame --line-porcelain"},
     {"base": "rustup toolchain", "flag": "list", "key": "rustup toolchain list"},
     {"base": "rustup target", "flag": "list", "key": "rustup target list"},
     {"base": "rustup component", "flag": "list", "key": "rustup component list"},
@@ -2528,6 +2557,7 @@ def _option_variant(name, args, with_sub):
   elif (name == "ssh" && contains(args, "-G")): "ssh config"
   elif (name == "ssh-add" && contains(args, "-L")): "ssh-add -L"
   elif (name == "ssh-add" && contains(args, "-l")): "ssh-add -l"
+  elif (name == "gpg" && contains(args, "--with-colons") && (contains(args, "--list-keys") || contains(args, "-k") || contains(args, "--list-public-keys") || contains(args, "--list-secret-keys") || contains(args, "-K"))): "gpg keys"
   elif (name == "rsync" && contains(args, "--stats")): "rsync stats"
   elif (name == "rsync" && (_has_short_flag(args, "i") || contains(args, "--itemize-changes"))): "rsync itemize"
   elif (name == "service" && contains(args, "--status-all")): "service status-all"
@@ -2571,8 +2601,8 @@ end
 
 # Parses the output of a command with the parser registered for `key`, such
 # as "ps", "df", "id", "ping", "git log", "git diff --stat", "pip list",
-# "docker ps", "kubectl get", "ip addr" or "ss". See the README for the
-# full list. Raises an error for an unknown key.
+# "docker ps", "kubectl get", "ip addr" or "ss". Raises an error for an
+# unknown key.
 #
 # Naming a parser is a claim about the text, not a way past the checks: when
 # the parser has a signature the text must fit it, otherwise an error lists
