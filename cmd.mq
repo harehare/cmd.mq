@@ -2215,6 +2215,36 @@ def _gpg_colons_parse(output):
   filter(map(_lines(output), _gpg_colon_row), fn(row): !is_none(row);)
 end
 
+# Reads the line-oriented porcelain v2 format without the `-z` option.
+def _git_status_v2_spec():
+  {"type": "regex", "patterns": [
+    {"re": "^# (?<name>branch\\.[a-z]+|stash) (?<value>.*)$", "set": {"record": "header"}},
+    {"re": "^2 (?<xy>\\S{2}) (?<submodule>\\S+) (?<head_mode>\\S+) (?<index_mode>\\S+) (?<worktree_mode>\\S+) (?<head_oid>\\S+) (?<index_oid>\\S+) (?<score>[RC]\\d+) (?<path>.*)\\t(?<original_path>.*)$", "set": {"record": "rename"}},
+    {"re": "^1 (?<xy>\\S{2}) (?<submodule>\\S+) (?<head_mode>\\S+) (?<index_mode>\\S+) (?<worktree_mode>\\S+) (?<head_oid>\\S+) (?<index_oid>\\S+) (?<path>.*)$", "set": {"record": "change"}},
+    {"re": "^u (?<xy>\\S{2}) (?<submodule>\\S+) (?<base_mode>\\S+) (?<ours_mode>\\S+) (?<theirs_mode>\\S+) (?<worktree_mode>\\S+) (?<base_oid>\\S+) (?<ours_oid>\\S+) (?<theirs_oid>\\S+) (?<path>.*)$", "set": {"record": "unmerged"}},
+    {"re": "^\\? (?<path>.*)$", "set": {"record": "untracked"}},
+    {"re": "^! (?<path>.*)$", "set": {"record": "ignored"}}
+  ]}
+end
+
+# Extracts certificate identity, validity, public key details and extensions
+# from `openssl x509 -text -noout` without retaining key or signature dumps.
+def _openssl_x509_text_spec():
+  {"type": "record", "require": ["subject", "issuer"], "captures": [
+    {"re": "(?m)^[ \\t]*Version: (?<version>\\d+)"},
+    {"re": "(?m)^[ \\t]*Serial Number:[ \\t]*(?<serial>[^\\n]+)$"},
+    {"re": "(?m)^[ \\t]*Serial Number:[ \\t]*\\n[ \\t]+(?<serial>[0-9a-fA-F:]+)$"},
+    {"re": "(?m)^[ \\t]*Signature Algorithm: (?<signature_algorithm>[^\\n]+)$"},
+    {"re": "(?m)^[ \\t]*Issuer: (?<issuer>[^\\n]+)$"},
+    {"re": "(?m)^[ \\t]*Not Before: (?<not_before>[^\\n]+)$"},
+    {"re": "(?m)^[ \\t]*Not After[ \\t]*: (?<not_after>[^\\n]+)$"},
+    {"re": "(?m)^[ \\t]*Subject: (?<subject>[^\\n]+)$"},
+    {"re": "(?m)^[ \\t]*Public Key Algorithm: (?<public_key_algorithm>[^\\n]+)$"},
+    {"re": "(?m)^[ \\t]*(?:RSA Public-Key|Public-Key): \\((?<public_key_bits>\\d+) bit\\)"},
+    {"re": "(?m)^[ \\t]+X509v3 (?<name>[A-Z][^:\\n]+):[ \\t]*(?<critical>critical)?[ \\t]*\\n(?<value>(?:[ \\t]{16,}[^\\n]*(?:\\n|$))*)", "all": true, "into": "extensions", "fields": {"critical": {"type": "bool", "true_values": ["critical"], "default": false}, "value": {"trim": true, "squeeze": true}}}
+  ]}
+end
+
 # Parser registry. Entries without a signature are used only when named.
 def _registry():
   [
@@ -2285,6 +2315,7 @@ def _registry():
     {"key": "git log", "sig": "\\Acommit [0-9a-f]{7,64}", "parse": {"type": "blocks", "start": "^commit ", "require": ["commit"], "captures": [{"re": "^commit (?<commit>[0-9a-f]+)(?: \\((?<refs>[^)]*)\\))?"}, {"re": "(?m)^Author: (?<author>.*)$"}, {"re": "(?m)^Date:\\s+(?<date>.*)$"}, {"re": "(?m)^Merge: (?<merge>.*)$"}, {"re": "(?m)^ {4}(?<value>.*)$", "all": true, "values": true, "into": "message", "join": "\n", "trim": true}]}},
     {"key": "git log --oneline", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<commit>[0-9a-f]{7,40})(?: \\((?<refs>[^)]*)\\))? (?<message>.*)$"]}},
     {"key": "git status", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<index>.)(?<worktree>.) (?<orig_path>.+?) -> (?<path>.+)$", "^(?<index>.)(?<worktree>.) (?<path>.+)$"], "skip": ["^## "], "keep_empty": true}},
+    {"key": "git status --porcelain=v2", "sig": None, "parse": _git_status_v2_spec()},
     {"key": "git branch", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<mark>[*+ ]) (?<name>\\S+)\\s+(?<commit>[0-9a-f]{7,40})\\s+(?<message>.*)$", "^(?<mark>[*+ ]) (?<name>.+?)\\s*$"]}, "fields": {"mark": {"type": "bool", "true_values": ["*"], "false_values": [" ", "+"], "rename": "current"}}},
     {"key": "git diff --numstat", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<added>\\d+|-)\\t(?<deleted>\\d+|-)\\t(?<path>.*)$"]}, "fields": {"added": {"type": "int", "null_if": ["-"]}, "deleted": {"type": "int", "null_if": ["-"]}}},
     {"key": "git diff --stat", "sig": "^ \\d+ files? changed", "parse": git_diff_stat_parse},
@@ -2465,6 +2496,8 @@ def _registry():
     {"key": "losetup", "sig": None, "parse": {"type": "columns"}},
     {"key": "rclone lsd", "sig": None, "parse": {"type": "regex", "patterns": ["^\\s*(?<size>-?\\d+)\\s+(?<date>\\d{4}-\\d{2}-\\d{2})\\s+(?<time>\\d{2}:\\d{2}:\\d{2})\\s+-?\\d+\\s+(?<path>.*)$"]}, "fields": {"size": {"type": "int"}}},
     {"key": "openssl", "sig": None, "parse": {"type": "regex", "single": true, "patterns": ["^OpenSSL (?<version>\\S+)(?: (?<built>.*))?$"]}},
+    {"key": "openssl x509 text", "sig": "\\ACertificate:[ \\t]*\\n[ \\t]*Data:", "parse": _openssl_x509_text_spec(), "fields": {"version": {"type": "int"}, "public_key_bits": {"type": "int"}, "serial": {"trim": true}}},
+    {"key": "openssl x509 summary", "sig": None, "parse": {"type": "record", "patterns": ["(?m)^subject\\s*=\\s*(?<subject>.*)$", "(?m)^issuer\\s*=\\s*(?<issuer>.*)$", "(?m)^serial\\s*=\\s*(?<serial>.*)$", "(?m)^notBefore=(?<not_before>.*)$", "(?m)^notAfter=(?<not_after>.*)$", "(?im)^(?<fingerprint_algorithm>[a-z0-9-]+) Fingerprint=(?<fingerprint>[0-9a-f:]+)$"]}},
     {"key": "rustc", "sig": None, "parse": {"type": "regex", "single": true, "patterns": ["^rustc (?<version>\\S+)(?: \\((?<commit>[0-9a-f]+) (?<date>\\d{4}-\\d{2}-\\d{2})\\))?$"]}},
     {"key": "resolvectl status", "sig": "\\A(?:Global|Link \\d+ \\([^)\\n]+\\))\\n", "parse": {"type": "blocks", "start": "^(?:Global|Link \\d+)", "require": ["name"], "captures": [{"re": "^(?<name>Global|Link \\d+(?: \\([^)]*\\))?)"}, {"re": "(?m)^[ \\t]*(?<key>[A-Za-z][^:\\n]*?):[ \\t]*(?<value>\\S.*)$", "all": true, "merge": true}]}},
     {"key": "systemd-analyze blame", "sig": _shape("\\s*(?:[\\d.]+(?:h|min|s|ms|us|d) ?)+\\s+\\S+\\.(?:service|mount|target|socket|timer|device|path|slice|scope|swap|automount)"), "parse": {"type": "regex", "trim": true, "patterns": ["^(?<time>(?:[\\d.]+(?:h|min|s|ms|us|d) ?)+?)\\s+(?<unit>\\S+)$"]}},
@@ -2546,7 +2579,9 @@ end
 
 # Handles formats selected by options that are not part of a subcommand.
 def _option_variant(name, args, with_sub):
-  if (name == "dpkg" && (contains(args, "-s") || contains(args, "--status"))): "dpkg status"
+  if (with_sub == "git status" && (contains(args, "--porcelain=v2") || contains(args, "--porcelain=2"))):
+    if (contains(args, "-z") || contains(args, "--null")): "git status --porcelain=v2 -z" else: "git status --porcelain=v2"
+  elif (name == "dpkg" && (contains(args, "-s") || contains(args, "--status"))): "dpkg status"
   elif (name == "netstat" && (contains(args, "-r") || contains(args, "-rn") || contains(args, "-nr") || contains(args, "--route"))): "netstat routes"
   elif (name == "lscpu" && (contains(args, "-e") || contains(args, "--extended"))): "lscpu extended"
   elif (name == "pkg-config" && contains(args, "--list-all")): "pkg-config list"
@@ -2558,6 +2593,8 @@ def _option_variant(name, args, with_sub):
   elif (name == "ssh-add" && contains(args, "-L")): "ssh-add -L"
   elif (name == "ssh-add" && contains(args, "-l")): "ssh-add -l"
   elif (name == "gpg" && contains(args, "--with-colons") && (contains(args, "--list-keys") || contains(args, "-k") || contains(args, "--list-public-keys") || contains(args, "--list-secret-keys") || contains(args, "-K"))): "gpg keys"
+  elif (with_sub == "openssl x509" && contains(args, "-text")): "openssl x509 text"
+  elif (with_sub == "openssl x509" && contains(args, "-noout") && (contains(args, "-subject") || contains(args, "-issuer") || contains(args, "-serial") || contains(args, "-dates") || contains(args, "-startdate") || contains(args, "-enddate") || contains(args, "-fingerprint"))): "openssl x509 summary"
   elif (name == "rsync" && contains(args, "--stats")): "rsync stats"
   elif (name == "rsync" && (_has_short_flag(args, "i") || contains(args, "--itemize-changes"))): "rsync itemize"
   elif (name == "service" && contains(args, "--status-all")): "service status-all"

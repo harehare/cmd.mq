@@ -644,6 +644,7 @@ def _sig_fixtures():
     ["timedatectl", "               Local time: Sat 2026-09-20 12:00:00 JST\n           Universal time: Sat 2026-09-20 03:00:00 UTC"],
     ["git log", "commit abc1234 (HEAD -> main)\nAuthor: A <a@x.dev>\nDate:   Mon Jan 1 12:00:00 2024 +0000\n\n    fix bug\n"],
     ["git blame --line-porcelain", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1 1 1\nauthor Alice\nauthor-mail <alice@example.test>\nauthor-time 1700000000\nfilename a.txt\n\tfirst line\n"],
+    ["openssl x509 text", "Certificate:\n    Data:\n        Version: 3 (0x2)\n    Signature Algorithm: sha256WithRSAEncryption\n        Issuer: CN=Example CA\n        Subject: CN=example.test\n"],
     ["git diff --stat", " src/a.rs | 5 ++---\n 1 file changed, 2 insertions(+), 3 deletions(-)"],
     ["git remote", "origin\thttps://example.com/r.git (fetch)\norigin\thttps://example.com/r.git (push)"],
     ["git stash", "stash@{0}: WIP on main: abc1234 fix bug"],
@@ -811,6 +812,50 @@ def test_git_blame_line_porcelain_keeps_line_metadata_and_blank_content():
   | assert_eq(rows[1]["content"], "")
   | assert_eq(rows[1]["final_line"], 2)
   | assert_eq(_parser_key("git", ["blame", "--line-porcelain", "a.txt"]), "git blame --line-porcelain")
+end
+
+def test_git_status_porcelain_v2_reads_each_record_shape():
+  let output = "# branch.oid abc1234\n# branch.head main\n# branch.ab +2 -1\n# future.field ignored\n1 .M N... 100644 100644 100644 abc1234 def5678 src/a file.mq\n2 R. N... 100644 100644 100644 abc1234 def5678 R100 src/new name.mq\tsrc/old name.mq\nu UU N... 100644 100644 100644 100644 aaa111 bbb222 ccc333 src/conflict.mq\n? new file.txt\n! ignored.txt"
+  | let rows = parse_output("git status --porcelain=v2", output)
+  | assert_eq(len(rows), 8)
+  | assert_eq(rows[0], {"name": "branch.oid", "value": "abc1234", "record": "header"})
+  | assert_eq(rows[2], {"name": "branch.ab", "value": "+2 -1", "record": "header"})
+  | assert_eq(rows[3]["record"], "change")
+  | assert_eq(rows[3]["path"], "src/a file.mq")
+  | assert_eq(rows[4]["record"], "rename")
+  | assert_eq(rows[4]["score"], "R100")
+  | assert_eq(rows[4]["original_path"], "src/old name.mq")
+  | assert_eq(rows[5]["record"], "unmerged")
+  | assert_eq(rows[5]["ours_oid"], "bbb222")
+  | assert_eq(rows[6]["record"], "untracked")
+  | assert_eq(rows[7]["record"], "ignored")
+end
+
+def test_git_status_porcelain_v2_dispatch_and_ignored_items():
+  assert_eq(_parser_key("git", ["status", "--porcelain=v2", "--branch"]), "git status --porcelain=v2")
+  | assert_eq(_parser_key("git", ["status", "--porcelain=2"]), "git status --porcelain=v2")
+  | assert_eq(_parser_key("git", ["status", "--porcelain=v2", "-z"]), "git status --porcelain=v2 -z")
+  | assert_eq(parse_output("git status --porcelain=v2", "! ignored.txt"), [{"path": "ignored.txt", "record": "ignored"}])
+end
+
+def test_openssl_x509_summary_reads_selected_certificate_fields():
+  let output = "subject= CN=example.test\nissuer= CN=Example CA\nserial=00AB12\nnotBefore=Jan  1 00:00:00 2025 GMT\nnotAfter=Jan  1 00:00:00 2027 GMT\nSHA256 Fingerprint=AA:BB:CC:DD"
+  | assert_eq(parse_output("openssl x509 summary", output), {"subject": "CN=example.test", "issuer": "CN=Example CA", "serial": "00AB12", "not_before": "Jan  1 00:00:00 2025 GMT", "not_after": "Jan  1 00:00:00 2027 GMT", "fingerprint_algorithm": "SHA256", "fingerprint": "AA:BB:CC:DD"})
+  | assert_eq(_parser_key("openssl", ["x509", "-in", "cert.pem", "-noout", "-subject", "-dates"]), "openssl x509 summary")
+end
+
+def test_openssl_x509_text_reads_identity_validity_and_extensions():
+  let output = "Certificate:\n    Data:\n        Version: 3 (0x2)\n        Serial Number: 1234 (0x4d2)\n    Signature Algorithm: sha256WithRSAEncryption\n        Issuer: CN=Example CA\n        Validity\n            Not Before: Jan  1 00:00:00 2025 GMT\n            Not After : Jan  1 00:00:00 2027 GMT\n        Subject: CN=example.test\n        Subject Public Key Info:\n            Public Key Algorithm: rsaEncryption\n                Public-Key: (2048 bit)\n        X509v3 extensions:\n            X509v3 Subject Alternative Name: critical\n                DNS:example.test, DNS:www.example.test\n            X509v3 Key Usage: \n                Digital Signature, Key Encipherment\n            X509v3 Certificate Policies:\n                Policy: Example Policy\n                  CPS: https://example.test/cps\n    Signature Algorithm: sha256WithRSAEncryption\n"
+  | let result = parse_output("openssl x509 text", output)
+  | assert_eq(result["version"], 3)
+  | assert_eq(result["serial"], "1234 (0x4d2)")
+  | assert_eq(result["subject"], "CN=example.test")
+  | assert_eq(result["issuer"], "CN=Example CA")
+  | assert_eq(result["not_after"], "Jan  1 00:00:00 2027 GMT")
+  | assert_eq(result["public_key_bits"], 2048)
+  | assert_eq(result["extensions"], [{"name": "Subject Alternative Name", "critical": true, "value": "DNS:example.test, DNS:www.example.test"}, {"name": "Key Usage", "critical": false, "value": "Digital Signature, Key Encipherment"}, {"name": "Certificate Policies", "critical": false, "value": "Policy: Example Policy CPS: https://example.test/cps"}])
+  | assert_eq(_parser_key("openssl", ["x509", "-in", "cert.pem", "-noout", "-text"]), "openssl x509 text")
+  | assert_eq(parse_output("openssl x509 text", "Certificate:\n    Data:\n        Serial Number:\n            01:AB:CD\n        Issuer: CN=Example CA\n        Subject: CN=example.test\n")["serial"], "01:AB:CD")
 end
 
 def test_gpg_colon_key_records_keep_known_fields_and_ignore_unknown_records():

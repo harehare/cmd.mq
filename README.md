@@ -32,6 +32,12 @@ Run and parse a command in one call. `run()` requires mq's `--allow-run` option:
 mq -L . -I null --allow-run=df -F json 'import "cmd" | cmd::run("df", ["-k"])'
 ```
 
+Extract certificate details from text output:
+
+```sh
+openssl x509 -in cert.pem -noout -text | mq -L . -I raw -F json 'import "cmd" | cmd::parse_output("openssl x509 text", .)'
+```
+
 ## API
 
 - `parse_output(key, output)` parses text using a named command, such as `"git log"` or `"ip addr"`.
@@ -62,6 +68,7 @@ Use `sig: None` when the output is too generic for automatic detection. For a si
 - `df` output with spaces in filesystem names may shift columns. `ls -l` parsing expects its default time format.
 - Aligned tables containing wide characters may need a command-specific parser.
 - Some platform-specific commands have only been tested against sample output.
+- `git status --porcelain=v2` reads line-separated output. Its `-z` form needs a different parser.
 
 ## License
 
