@@ -1768,6 +1768,11 @@ def _shape(pattern):
   | "\\A\\n*(?:" + p + "\\n+)*" + p + "\\n*\\z"
 end
 
+# Reads rustup's installed marker while keeping unmarked entries explicit.
+def _rustup_items():
+  {"type": "regex", "patterns": ["^(?<name>\\S+) \\((?<installed>installed)\\)$", "^(?<name>\\S+)$"]}
+end
+
 # Definition engine. A registry entry describes a parser as data: `parse` is
 # a spec dict (or a function for formats the engine cannot express), and
 # `fields` holds the per-field rules. Adding a command means adding an entry.
@@ -2272,11 +2277,39 @@ def _registry():
     {"key": "git ls-tree", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<mode>\\d+) (?<type>\\S+) (?<object>[0-9a-f]{7,64})\\t(?<path>.*)$"]}, "fields": {"mode": {"type": "int"}}},
     {"key": "git tag", "sig": None, "parse": {"type": "lines"}},
     {"key": "git for-each-ref", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<object>[0-9a-f]{7,64}) (?<type>commit|tag|tree|blob)\\t(?<ref>refs/\\S+)$"]}},
+    {"key": "git rev-parse", "sig": None, "parse": {"type": "lines"}},
+    {"key": "git describe", "sig": None, "parse": {"type": "regex", "single": true, "patterns": ["^(?<description>[^\\n]+)$"]}},
+    {"key": "git check-ignore -v", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<source>.+):(?<line>\\d+):(?<pattern>.*)\\t(?<path>.*)$"]}, "fields": {"line": {"type": "int"}}},
     {"key": "git ls-remote", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<commit>[0-9a-f]{7,64})\\t(?<ref>.*)$"]}},
     {"key": "git show-ref", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<commit>[0-9a-f]{7,64})\\s+(?<ref>.*)$"]}},
     {"key": "git submodule", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<status>[ +-])?(?<commit>[0-9a-f]{7,40})\\s+(?<path>.*?)(?: \\((?<description>.*)\\))?$"]}},
     {"key": "git worktree", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<path>.+?)\\s+(?<commit>[0-9a-f]{7,40})\\s+(?:\\[(?<branch>[^\\]]+)\\]|\\((?<state>[^)]+)\\))"]}},
     {"key": "git config", "sig": None, "parse": {"type": "kv", "separator": "="}},
+    {"key": "pkg-config list", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<name>\\S+)\\s+(?<title>.+?) - (?<description>.*)$"]}},
+    {"key": "pkg-config version", "sig": None, "parse": {"type": "lines"}},
+    {"key": "rustup toolchain list", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<name>\\S+) \\((?<active>active), (?<default>default)\\)$", "^(?<name>\\S+) \\((?<active>active)\\)$", "^(?<name>\\S+) \\((?<default>default)\\)$", "^(?<name>\\S+)$"], "skip": ["^no installed toolchains$"]}, "fields": {"active": {"type": "bool", "true_values": ["active"], "default": false}, "default": {"type": "bool", "true_values": ["default"], "default": false}}},
+    {"key": "rustup target list", "sig": None, "parse": _rustup_items(), "fields": {"installed": {"type": "bool", "true_values": ["installed"], "default": false}}},
+    {"key": "rustup component list", "sig": None, "parse": _rustup_items(), "fields": {"installed": {"type": "bool", "true_values": ["installed"], "default": false}}},
+    {"key": "ssh-add -L", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<type>(?:ssh|ecdsa|sk)-\\S+)\\s+(?<key>[A-Za-z0-9+/=]+)(?:\\s+(?<comment>.*))?$"]}},
+    {"key": "ssh-keyscan", "sig": None, "parse": {"type": "regex", "skip": ["^#"], "patterns": ["^(?<host>\\S+)\\s+(?<type>(?:ssh|ecdsa|sk)-\\S+)\\s+(?<key>[A-Za-z0-9+/=]+)$"]}},
+    {"key": "rsync stats", "sig": None, "parse": {"type": "regex", "as": "map", "normalize_keys": true, "start_at": "^Number of files:", "patterns": ["^(?<key>[A-Za-z][A-Za-z ]+):\\s*(?<value>.+)$"]}},
+    {"key": "mise ls", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<tool>\\S+)\\s+(?<version>\\S+)\\s+\\((?<installed>missing)\\)\\s+(?<source>\\S+)(?:\\s+(?<requested>\\S+))?$", "^(?<tool>\\S+)\\s+(?<version>\\S+)\\s+(?<source>\\S+)(?:\\s+(?<requested>\\S+))?$", "^(?<tool>\\S+)\\s+(?<version>\\S+)$"]}, "fields": {"installed": {"type": "bool", "false_values": ["missing"], "default": true}}},
+    {"key": "taskset", "sig": "\\Apid \\d+'s (?:current|new) affinity (?:mask|list): [^\\n]+\\n*\\z", "parse": {"type": "regex", "single": true, "patterns": ["^pid (?<pid>\\d+)'s (?<state>current|new) affinity (?<format>mask|list): (?<affinity>\\S+)$"]}, "fields": {"pid": {"type": "int"}}},
+    {"key": "rfkill", "sig": "\\AID\\s+TYPE\\s+DEVICE\\s+SOFT\\s+HARD", "parse": {"type": "columns"}, "fields": {"id": {"type": "int"}}},
+    {"key": "rfkill list", "sig": None, "parse": {"type": "blocks", "start": "^\\d+: ", "require": ["id"], "captures": [{"re": "(?m)^(?<id>\\d+): (?<device>[^:]+): (?<type>.*)$"}, {"re": "Soft blocked: (?<soft>yes|no)"}, {"re": "Hard blocked: (?<hard>yes|no)"}]}, "fields": {"id": {"type": "int"}, "soft": {"type": "bool", "true_values": ["yes"], "false_values": ["no"]}, "hard": {"type": "bool", "true_values": ["yes"], "false_values": ["no"]}}},
+    {"key": "ldconfig cache", "sig": None, "parse": {"type": "regex", "patterns": ["^\\s*(?<name>\\S+) \\((?<abi>[^)]+)\\) => (?<path>\\S+)$"]}},
+    {"key": "size", "sig": "\\A\\s*(?:text\\s+data\\s+bss\\s+dec\\s+hex\\s+filename|__TEXT\\s+__DATA\\s+__OBJC\\s+others\\s+dec\\s+hex)", "parse": {"type": "choice", "options": [{"when": "\\A\\s*__TEXT\\s", "parse": {"type": "columns"}, "fields": {"__text": {"type": "int"}, "__data": {"type": "int"}, "__objc": {"type": "int"}, "others": {"type": "int"}, "dec": {"type": "int"}}}, {"parse": {"type": "columns"}, "fields": {"text": {"type": "int"}, "data": {"type": "int"}, "bss": {"type": "int"}, "dec": {"type": "int"}}}]}},
+    {"key": "readelf header", "sig": "\\AELF Header:\\n", "parse": {"type": "regex", "as": "map", "normalize_keys": true, "start_at": "^ELF Header:", "until_blank": true, "patterns": ["^\\s*(?<key>[A-Za-z][A-Za-z /]+):\\s*(?<value>\\S.*)$"]}},
+    {"key": "readelf dynamic", "sig": None, "parse": {"type": "regex", "patterns": ["^\\s*(?<tag>0x[0-9a-fA-F]+) \\((?<type>[^)]+)\\)\\s+(?<value>.*)$"]}},
+    {"key": "nm", "sig": None, "parse": {"type": "regex", "patterns": ["^\\s*(?<address>[0-9a-fA-F]+)\\s+(?<type>[A-Za-z])\\s+(?<name>\\S.*)$", "^\\s*(?<type>[A-Za-z])\\s+(?<name>\\S.*)$"]}},
+    {"key": "ar t", "sig": None, "parse": {"type": "lines"}},
+    {"key": "hyperfine", "sig": "^Benchmark \\d+: ", "parse": {"type": "blocks", "start": "^Benchmark \\d+: ", "require": ["index"], "captures": [{"re": "^Benchmark (?<index>\\d+): (?<command>.*)"}, {"re": "Time \\(mean ± σ\\):\\s+(?<mean>[\\d.]+) (?<mean_unit>\\S+) ±\\s+(?<stddev>[\\d.]+) (?<stddev_unit>\\S+)"}, {"re": "Range \\(min … max\\):\\s+(?<min>[\\d.]+) (?<min_unit>\\S+) …\\s+(?<max>[\\d.]+) (?<max_unit>\\S+)\\s+(?<runs>\\d+) runs?"}]}, "fields": {"index": {"type": "int"}, "mean": {"type": "float"}, "stddev": {"type": "float"}, "min": {"type": "float"}, "max": {"type": "float"}, "runs": {"type": "int"}}},
+    {"key": "just list", "sig": "\\AAvailable recipes:", "parse": {"type": "blocks", "start": "^(?:Available recipes:|    \\[[^]]+\\])", "captures": [{"re": "(?m)^    \\[(?<group>[^]]+)\\]$"}, {"re": "(?m)^    (?<name>[^\\s\\[]\\S*)(?:\\s+(?<parameters>[^#\\s][^#\\n]*?))?(?:\\s+#\\s*(?<description>.*))?\\s*$", "all": true, "into": "recipes", "fields": {"parameters": {"trim": true}}}]}},
+    {"key": "shellcheck gcc", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<file>.+?):(?<line>\\d+):(?<column>\\d+): (?<severity>error|warning|note|style): (?<message>.*) \\[(?<code>SC\\d+)\\]$"]}, "fields": {"line": {"type": "int"}, "column": {"type": "int"}}},
+    {"key": "actionlint oneline", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<file>.+?):(?<line>\\d+):(?<column>\\d+): (?<message>.*) \\[(?<rule>[^]]+)\\]$"]}, "fields": {"line": {"type": "int"}, "column": {"type": "int"}}},
+    {"key": "ssh config", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<key>[a-z][a-z0-9]*) (?<value>.*)$"], "keep_empty": true}},
+    {"key": "rsync itemize", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<change>[<>ch.][^\\s]*|\\*deleting)\\s+(?<path>.*)$"]}},
+    {"key": "service status-all", "sig": None, "parse": {"type": "regex", "patterns": ["^\\s*\\[ (?<state>[+?-]) \\]\\s+(?<name>\\S+)$"]}},
     {"key": "pip list", "sig": "\\A\\s*Package\\s+Version", "parse": {"type": "aligned", "offsets": "dashes"}},
     {"key": "pip freeze", "sig": _shape("[A-Za-z0-9_.-]+(?:==\\S+| @ \\S+)"), "parse": {"type": "regex", "patterns": ["^(?<name>[^=@\\s]+)(?:==(?<version>\\S+)| @ (?<url>\\S+))$"]}},
     {"key": "pip show", "sig": "\\AName: [^\\n]+\\nVersion: ", "parse": {"type": "kv", "blocks": true, "replace": [["\\n---\\n", "\n\n"]]}},
@@ -2418,7 +2451,7 @@ def _name_aliases():
     "pip3": "pip", "yum": "dnf", "podman": "docker", "ping6": "ping", "printenv": "env", "journalctl": "syslog", "tracepath": "traceroute",
     "md5": "checksum", "md5sum": "checksum", "shasum": "checksum", "sha1sum": "checksum", "sha224sum": "checksum", "sha256sum": "checksum", "sha384sum": "checksum", "sha512sum": "checksum", "b2sum": "checksum",
     "sum": "cksum", "dpkg-query": "dpkg", "networkctl": "networkctl list", "busctl": "busctl list", "resolvectl": "resolvectl status", "systemd-resolve": "resolvectl status",
-    "rg": "grep", "egrep": "grep", "fgrep": "grep", "ag": "grep", "find": "lines"
+    "rg": "grep", "egrep": "grep", "fgrep": "grep", "ag": "grep", "find": "lines", "pkgconf": "pkg-config"
   }
 end
 
@@ -2430,7 +2463,8 @@ def _key_aliases():
     "getent passwd": "passwd", "getent group": "group", "apt-get list": "apt list",
     "nmcli con": "nmcli connection", "nmcli c": "nmcli connection", "nmcli dev": "nmcli device", "nmcli d": "nmcli device",
     "localectl status": "localectl", "lsb_release a": "lsb_release",
-    "ip neigh": "ip neighbour", "ip neighbor": "ip neighbour", "ip n": "ip neighbour"
+    "ip neigh": "ip neighbour", "ip neighbor": "ip neighbour", "ip n": "ip neighbour",
+    "pkgconf list": "pkg-config list", "pkgconf version": "pkg-config version", "ssh-add -l": "ssh-keygen"
   }
 end
 
@@ -2465,10 +2499,20 @@ def _flag_variant(with_sub, args):
     {"base": "git diff", "flag": "--name-only", "key": "git diff --name-only"},
     {"base": "git diff", "flag": "--shortstat", "key": "git diff --shortstat"},
     {"base": "git diff", "flag": "--stat", "key": "git diff --stat"},
+    {"base": "git check-ignore", "flag": "-v", "key": "git check-ignore -v"},
+    {"base": "git check-ignore", "flag": "--verbose", "key": "git check-ignore -v"},
+    {"base": "rustup toolchain", "flag": "list", "key": "rustup toolchain list"},
+    {"base": "rustup target", "flag": "list", "key": "rustup target list"},
+    {"base": "rustup component", "flag": "list", "key": "rustup component list"},
     {"base": "uv pip", "flag": "show", "key": "uv pip show"}
   ]
   | let matches = filter(variants, fn(v): v["base"] == with_sub && contains(args, v["flag"]);)
   | if (is_empty(matches)): with_sub else: matches[0]["key"]
+end
+
+# Recognizes a short option alone or inside a bundle such as `-avi`.
+def _has_short_flag(args, flag):
+  contains(map(args, fn(arg): is_regex_match(arg, "^-[A-Za-z]*" + flag + "[A-Za-z]*$");), true)
 end
 
 # Handles formats selected by options that are not part of a subcommand.
@@ -2476,6 +2520,21 @@ def _option_variant(name, args, with_sub):
   if (name == "dpkg" && (contains(args, "-s") || contains(args, "--status"))): "dpkg status"
   elif (name == "netstat" && (contains(args, "-r") || contains(args, "-rn") || contains(args, "-nr") || contains(args, "--route"))): "netstat routes"
   elif (name == "lscpu" && (contains(args, "-e") || contains(args, "--extended"))): "lscpu extended"
+  elif (name == "pkg-config" && contains(args, "--list-all")): "pkg-config list"
+  elif (name == "pkg-config" && contains(args, "--modversion")): "pkg-config version"
+  elif (name == "just" && (contains(args, "--list") || contains(args, "-l"))): "just list"
+  elif (name == "shellcheck" && (contains(args, "--format=gcc") || contains(args, "-f=gcc"))): "shellcheck gcc"
+  elif (name == "actionlint" && contains(args, "-oneline")): "actionlint oneline"
+  elif (name == "ssh" && contains(args, "-G")): "ssh config"
+  elif (name == "ssh-add" && contains(args, "-L")): "ssh-add -L"
+  elif (name == "ssh-add" && contains(args, "-l")): "ssh-add -l"
+  elif (name == "rsync" && contains(args, "--stats")): "rsync stats"
+  elif (name == "rsync" && (_has_short_flag(args, "i") || contains(args, "--itemize-changes"))): "rsync itemize"
+  elif (name == "service" && contains(args, "--status-all")): "service status-all"
+  elif (name == "ldconfig" && (contains(args, "-p") || contains(args, "--print-cache"))): "ldconfig cache"
+  elif (name == "readelf" && (contains(args, "-h") || contains(args, "--file-header"))): "readelf header"
+  elif (name == "readelf" && (contains(args, "-d") || contains(args, "--dynamic"))): "readelf dynamic"
+  elif (name == "ar" && (contains(args, "t") || contains(args, "-t"))): "ar t"
   elif (name == "networksetup" && !is_empty(args)): "networksetup " + args[0]
   else: with_sub
 end
@@ -2486,14 +2545,15 @@ end
 # names what was asked for.
 def _parser_key(cmd, args):
   let base = basename(cmd)
-  | let name = if (base == "pip3"): "pip" elif (base == "yum"): "dnf" elif (base == "podman"): "docker" elif (base == "dpkg-query"): "dpkg" else: base
+  | let aliases = _name_aliases()
+  | let alias = if (has(aliases, base)): aliases[base] else: base
+  | let name = if (contains(alias, " ")): base else: alias
   | let value_flags = if (name == "git"): ["-C", "-c"] elif (name == "kubectl"): ["-n", "--namespace", "--context"] else: []
   | let sub = _subcommand(args, value_flags)
   | let with_sub = name + " " + sub
   | let flagged = _flag_variant(with_sub, args)
   | let variant = if (flagged != with_sub): flagged else: _option_variant(name, args, with_sub)
-  | if (variant != with_sub && !is_none(_find(variant))): variant
-    elif (sub != "" && !is_none(_find(variant))): variant
+  | if ((sub != "" || variant != with_sub) && !is_none(_find(variant))): variant
     elif (!is_none(_find(name))): name
     elif (sub != ""): variant
     else: name

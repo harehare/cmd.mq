@@ -557,6 +557,8 @@ def test_parser_key_uses_subcommand_and_aliases():
   | assert_eq(_parser_key("kubectl", ["-n", "prod", "get", "pods"]), "kubectl get")
   | assert_eq(_parser_key("podman", ["ps"]), "docker ps")
   | assert_eq(_parser_key("yum", ["list", "installed"]), "dnf list")
+  | assert_eq(_parser_key("rg", ["needle", "src"]), "grep")
+  | assert_eq(_parser_key("md5sum", ["file.txt"]), "checksum")
   | assert_eq(_parser_key("ps", ["aux"]), "ps")
 end
 
@@ -728,6 +730,12 @@ def _sig_fixtures():
     ["systemctl list-jobs", "JOB UNIT TYPE STATE\n  1 foo.service start running\n\n1 jobs listed.\n"],
     ["resolvectl status", "Global\n       Protocols: -LLMNR -mDNS\nresolv.conf mode: stub\n\nLink 2 (eth0)\n    Current Scopes: DNS\n       DNS Servers: 192.168.1.1\n"],
     ["systemd-analyze blame", "  4.512s NetworkManager-wait-online.service\n 1min 2.345s snapd.service\n  845ms foo.mount\n"],
+    ["taskset", "pid 42's current affinity mask: ff"],
+    ["rfkill", "ID TYPE DEVICE SOFT HARD\n0 wlan phy0 unblocked unblocked"],
+    ["size", "text data bss dec hex filename\n100 20 5 125 7d app"],
+    ["readelf header", "ELF Header:\n  Class: ELF64\n  Machine: AArch64\n"],
+    ["hyperfine", "Benchmark 1: true\n  Time (mean ± σ): 1.2 ms ± 0.1 ms\n  Range (min … max): 1.1 ms … 1.3 ms 3 runs"],
+    ["just list", "Available recipes:\n    build # Build the app\n    test"],
     ["fdisk", "Disk /dev/sda: 100 GiB, 107374182400 bytes, 209715200 sectors\nDisk model: VBOX HARDDISK   \nUnits: sectors of 1 * 512 = 512 bytes\nDisklabel type: gpt\nDisk identifier: 8F5F3A8B-1111-2222-3333-444455556666\n\nDevice       Start       End   Sectors  Size Type\n/dev/sda1     2048      4095      2048    1M BIOS boot\n/dev/sda2     4096   2101247   2097152    1G EFI System\n"]
   ]
 end
@@ -792,6 +800,108 @@ def test_added_git_output_formats():
   assert_eq(parse_output("git diff --name-only", "src/a.mq\nREADME.md\n"), ["src/a.mq", "README.md"])
   | assert_eq(parse_output("git tag", "v1.0.0\nv1.1.0\n"), ["v1.0.0", "v1.1.0"])
   | assert_eq(parse_output("git for-each-ref", "abc123456789 commit\trefs/heads/main\ndef123456789 tag\trefs/tags/v1.0.0"), [{"object": "abc123456789", "type": "commit", "ref": "refs/heads/main"}, {"object": "def123456789", "type": "tag", "ref": "refs/tags/v1.0.0"}])
+end
+
+def test_git_inspection_output_formats():
+  assert_eq(_parser_key("git", ["rev-parse", "HEAD"]), "git rev-parse")
+  | assert_eq(_parser_key("git", ["describe", "--always"]), "git describe")
+  | assert_eq(_parser_key("git", ["check-ignore", "-v", ".DS_Store"]), "git check-ignore -v")
+  | assert_eq(_parser_key("git", ["check-ignore", "--verbose", ".DS_Store"]), "git check-ignore -v")
+  | assert_eq(parse_output("git rev-parse", "abc123456789\n/checkout\n"), ["abc123456789", "/checkout"])
+  | assert_eq(parse_output("git describe", "v1.2.0-3-gabc1234\n"), {"description": "v1.2.0-3-gabc1234"})
+  | assert_eq(parse_output("git check-ignore -v", ".gitignore:1:.DS_Store\t.DS_Store"), [{"source": ".gitignore", "line": 1, "pattern": ".DS_Store", "path": ".DS_Store"}])
+  | assert_eq(try: parse_output("git check-ignore", ".DS_Store") catch: "error", "error")
+end
+
+def test_reference_inspired_command_formats():
+  let packages = parse_output("pkg-config list", "libcurl   libcurl - Library to transfer data with URLs\nexample example - A title - with details")
+  | assert_eq(packages, [{"name": "libcurl", "title": "libcurl", "description": "Library to transfer data with URLs"}, {"name": "example", "title": "example", "description": "A title - with details"}])
+  | assert_eq(parse_output("pkgconf list", "zlib zlib - Compression library")[0]["name"], "zlib")
+  | assert_eq(parse_output("rustup toolchain list", "stable-aarch64-apple-darwin (active, default)\nnightly-aarch64-apple-darwin"), [{"name": "stable-aarch64-apple-darwin", "active": true, "default": true}, {"name": "nightly-aarch64-apple-darwin", "active": false, "default": false}])
+  | assert_eq(parse_output("rustup toolchain list", "beta-x86_64-unknown-linux-gnu (default)\nstable-x86_64-unknown-linux-gnu (active)"), [{"name": "beta-x86_64-unknown-linux-gnu", "active": false, "default": true}, {"name": "stable-x86_64-unknown-linux-gnu", "active": true, "default": false}])
+  | assert_eq(parse_output("rustup toolchain list", "no installed toolchains"), [])
+  | assert_eq(parse_output("ssh-add -L", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample== user with spaces"), [{"type": "ssh-ed25519", "key": "AAAAC3NzaC1lZDI1NTE5AAAAIExample==", "comment": "user with spaces"}])
+  | assert_eq(parse_output("rsync stats", "sending incremental file list\n\nNumber of files: 2 (reg: 1, dir: 1)\nNumber of regular files transferred: 1\nTotal file size: 1,024 bytes\nTotal bytes sent: 1,081\n\nsent 1,081 bytes  received 35 bytes"), {"number_of_files": "2 (reg: 1, dir: 1)", "number_of_regular_files_transferred": "1", "total_file_size": "1,024 bytes", "total_bytes_sent": "1,081"})
+end
+
+def test_reference_inspired_command_dispatch():
+  assert_eq(_parser_key("pkg-config", ["--list-all"]), "pkg-config list")
+  | assert_eq(_parser_key("pkgconf", ["--list-all"]), "pkg-config list")
+  | assert_eq(_parser_key("rustup", ["toolchain", "list"]), "rustup toolchain list")
+  | assert_eq(_parser_key("ssh-add", ["-L"]), "ssh-add -L")
+  | assert_eq(_parser_key("rsync", ["-an", "--stats", "src", "dst"]), "rsync stats")
+  | assert_eq(_parser_key("pkg-config", ["--modversion", "zlib"]), "pkg-config version")
+end
+
+def test_system_inventory_formats():
+  assert_eq(parse_output("taskset", "pid 42's current affinity mask: ff"), {"pid": 42, "state": "current", "format": "mask", "affinity": "ff"})
+  | assert_eq(parse_output("taskset", "pid 42's new affinity list: 0-3"), {"pid": 42, "state": "new", "format": "list", "affinity": "0-3"})
+  | assert_eq(parse_output("rfkill", "ID TYPE DEVICE SOFT HARD\n0 wlan phy0 unblocked unblocked"), [{"id": 0, "type": "wlan", "device": "phy0", "soft": "unblocked", "hard": "unblocked"}])
+  | assert_eq(parse_output("rfkill list", "0: phy0: Wireless LAN\n\tSoft blocked: no\n\tHard blocked: yes"), [{"id": 0, "device": "phy0", "type": "Wireless LAN", "soft": false, "hard": true}])
+  | assert_eq(parse_output("ldconfig cache", "  libz.so.1 (libc6,x86-64) => /lib/libz.so.1"), [{"name": "libz.so.1", "abi": "libc6,x86-64", "path": "/lib/libz.so.1"}])
+  | assert_eq(parse_output("size", "text data bss dec hex filename\n100 20 5 125 7d my app"), [{"text": 100, "data": 20, "bss": 5, "dec": 125, "hex": "7d", "filename": "my app"}])
+  | assert_eq(parse_output("size", "__TEXT __DATA __OBJC others dec hex\n100 20 0 5 125 7d"), [{"__text": 100, "__data": 20, "__objc": 0, "others": 5, "dec": 125, "hex": "7d"}])
+  | assert_eq(parse_output("readelf header", "ELF Header:\n  Class: ELF64\n  OS/ABI: UNIX - System V\n  Entry point address: 0x1000\n\nSection Headers:"), {"class": "ELF64", "os_abi": "UNIX - System V", "entry_point_address": "0x1000"})
+end
+
+def test_development_inventory_formats():
+  assert_eq(parse_output("rustup target list", "aarch64-apple-darwin (installed)\nx86_64-unknown-linux-gnu"), [{"name": "aarch64-apple-darwin", "installed": true}, {"name": "x86_64-unknown-linux-gnu", "installed": false}])
+  | assert_eq(parse_output("rustup component list", "clippy-aarch64-apple-darwin (installed)\nrust-src"), [{"name": "clippy-aarch64-apple-darwin", "installed": true}, {"name": "rust-src", "installed": false}])
+  | assert_eq(parse_output("ssh-keyscan", "# host SSH-2.0-OpenSSH\nexample.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample=="), [{"host": "example.test", "type": "ssh-ed25519", "key": "AAAAC3NzaC1lZDI1NTE5AAAAIExample=="}])
+  | assert_eq(parse_output("mise ls", "node 22.1.0 ~/.config/mise/config.toml 22\ngo 1.26.0\npython 3.13.3 (missing) ~/.tool-versions 3.13.3"), [{"tool": "node", "version": "22.1.0", "source": "~/.config/mise/config.toml", "requested": "22", "installed": true}, {"tool": "go", "version": "1.26.0", "installed": true}, {"tool": "python", "version": "3.13.3", "source": "~/.tool-versions", "requested": "3.13.3", "installed": false}])
+end
+
+def test_inventory_command_dispatch():
+  assert_eq(_parser_key("rustup", ["target", "list"]), "rustup target list")
+  | assert_eq(_parser_key("rustup", ["component", "list"]), "rustup component list")
+  | assert_eq(_parser_key("rfkill", ["list"]), "rfkill list")
+  | assert_eq(_parser_key("ldconfig", ["-p"]), "ldconfig cache")
+  | assert_eq(_parser_key("readelf", ["-h", "app"]), "readelf header")
+  | assert_eq(_parser_key("size", ["app"]), "size")
+  | assert_eq(_parser_key("ssh-keyscan", ["example.test"]), "ssh-keyscan")
+  | assert_eq(_parser_key("mise", ["ls"]), "mise ls")
+end
+
+def test_more_development_formats():
+  assert_eq(parse_output("pkg-config version", "1.2.13\n2.4.0"), ["1.2.13", "2.4.0"])
+  | assert_eq(parse_output("pkgconf version", "1.2.13"), ["1.2.13"])
+  | assert_eq(parse_output("ssh-add -l", "256 SHA256:abc123 user@example.test (ED25519)"), [{"bits": 256, "fingerprint": "SHA256:abc123", "comment": "user@example.test", "type": "ED25519"}])
+  | assert_eq(parse_output("readelf dynamic", "Dynamic section at offset 0x100 contains 2 entries:\n  Tag Type Name/Value\n 0x0000000000000001 (NEEDED) Shared library: [libc.so.6]\n 0x0000000000000000 (NULL) 0x0"), [{"tag": "0x0000000000000001", "type": "NEEDED", "value": "Shared library: [libc.so.6]"}, {"tag": "0x0000000000000000", "type": "NULL", "value": "0x0"}])
+  | assert_eq(parse_output("nm", "0000000000001000 T main\n                 U printf\nlib.o:"), [{"address": "0000000000001000", "type": "T", "name": "main"}, {"type": "U", "name": "printf"}])
+  | assert_eq(parse_output("ar t", "one.o\ntwo.o\n"), ["one.o", "two.o"])
+  | assert_eq(parse_output("hyperfine", "Benchmark 1: true\n  Time (mean ± σ): 1.2 ms ± 0.1 ms\n  Range (min … max): 1.1 ms … 1.3 ms 3 runs\n\nBenchmark 2: false\n  Time (mean ± σ): 2.3 ms ± 0.2 ms\n  Range (min … max): 2.1 ms … 2.5 ms 3 runs"), [{"index": 1, "command": "true", "mean": 1.2, "mean_unit": "ms", "stddev": 0.1, "stddev_unit": "ms", "min": 1.1, "min_unit": "ms", "max": 1.3, "max_unit": "ms", "runs": 3}, {"index": 2, "command": "false", "mean": 2.3, "mean_unit": "ms", "stddev": 0.2, "stddev_unit": "ms", "min": 2.1, "min_unit": "ms", "max": 2.5, "max_unit": "ms", "runs": 3}])
+end
+
+def test_more_development_dispatch():
+  assert_eq(_parser_key("pkg-config", ["--modversion", "zlib"]), "pkg-config version")
+  | assert_eq(_parser_key("pkgconf", ["--modversion", "zlib"]), "pkg-config version")
+  | assert_eq(_parser_key("ssh-add", ["-l"]), "ssh-add -l")
+  | assert_eq(_parser_key("readelf", ["-d", "app"]), "readelf dynamic")
+  | assert_eq(_parser_key("ar", ["t", "lib.a"]), "ar t")
+  | assert_eq(_parser_key("nm", ["-D", "lib.so"]), "nm")
+end
+
+def test_task_and_diagnostic_formats():
+  assert_eq(parse_output("just list", "Available recipes:\n    build target=debug # Build binary\n    clean\n\n    [check]\n    lint # Check style"), [{"recipes": [{"name": "build", "parameters": "target=debug", "description": "Build binary"}, {"name": "clean"}]}, {"group": "check", "recipes": [{"name": "lint", "description": "Check style"}]}])
+  | assert_eq(parse_output("shellcheck gcc", "script.sh:3:4: warning: Quote this variable. [SC2086]"), [{"file": "script.sh", "line": 3, "column": 4, "severity": "warning", "message": "Quote this variable.", "code": "SC2086"}])
+  | assert_eq(parse_output("actionlint oneline", ".github/workflows/ci.yml:4:5: unexpected key \"branchs\" [syntax-check]"), [{"file": ".github/workflows/ci.yml", "line": 4, "column": 5, "message": "unexpected key \"branchs\"", "rule": "syntax-check"}])
+  | assert_eq(parse_output("ssh config", "host example.test\nidentityfile ~/.ssh/id_a\nidentityfile ~/.ssh/id_b"), [{"key": "host", "value": "example.test"}, {"key": "identityfile", "value": "~/.ssh/id_a"}, {"key": "identityfile", "value": "~/.ssh/id_b"}])
+end
+
+def test_transfer_and_service_formats():
+  assert_eq(parse_output("rsync itemize", ">f+++++++++ new.txt\n*deleting removed.txt\n.f...p..... keep.txt"), [{"change": ">f+++++++++", "path": "new.txt"}, {"change": "*deleting", "path": "removed.txt"}, {"change": ".f...p.....", "path": "keep.txt"}])
+  | assert_eq(parse_output("service status-all", " [ + ]  cron\n [ - ]  anacron\n [ ? ]  custom"), [{"state": "+", "name": "cron"}, {"state": "-", "name": "anacron"}, {"state": "?", "name": "custom"}])
+end
+
+def test_task_and_diagnostic_dispatch():
+  assert_eq(_parser_key("just", ["--list"]), "just list")
+  | assert_eq(_parser_key("shellcheck", ["-f", "gcc", "script.sh"]), "shellcheck gcc")
+  | assert_eq(_parser_key("shellcheck", ["--format=gcc", "script.sh"]), "shellcheck gcc")
+  | assert_eq(_parser_key("actionlint", ["-oneline"]), "actionlint oneline")
+  | assert_eq(_parser_key("ssh", ["-G", "example.test"]), "ssh config")
+  | assert_eq(_parser_key("rsync", ["-i", "-a", "src", "dst"]), "rsync itemize")
+  | assert_eq(_parser_key("rsync", ["-avi", "src", "dst"]), "rsync itemize")
+  | assert_eq(_parser_key("service", ["--status-all"]), "service status-all")
 end
 
 def test_uptime_signature_does_not_claim_the_w_output():
