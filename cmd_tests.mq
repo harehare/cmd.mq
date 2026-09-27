@@ -66,6 +66,12 @@ def test_ps_parse_empty_input():
   assert_eq(ps_parse(""), [])
 end
 
+def test_ps_custom_pid_command_header():
+  let text = "  PID COMMAND\n  123 /bin/sh -c echo hi"
+  | assert_eq(detect(text), ["ps"])
+  | assert_eq(parse_auto(text), [{"pid": 123, "command": "/bin/sh -c echo hi"}])
+end
+
 def test_df_parse_linux_kilobytes():
   let result = df_parse("Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/sda1 100 40 60 40% /")
   | assert_eq(result, [{"filesystem": "/dev/sda1", "1k-blocks": 100, "used": 40, "available": 60, "use_percent": "40%", "mounted_on": "/"}])
@@ -108,6 +114,18 @@ end
 
 def test_ls_parse_skips_non_entries():
   assert_eq(ls_parse("total 0\nnot an entry"), [])
+end
+
+def test_ls_human_readable_sizes():
+  let text = "total 8\n-rw-r--r--  1 alice staff 2.7K Jan  1 12:00 report.txt"
+  | assert_eq(detect(text), ["ls"])
+  | assert_eq(parse_auto(text)[0]["size"], "2.7K")
+end
+
+def test_ls_short_output_when_named():
+  assert_eq(parse_output("ls short", "a.txt\nmy file.txt\n"), [{"name": "a.txt"}, {"name": "my file.txt"}])
+  | assert_eq(_parser_key("ls", []), "ls short")
+  | assert_eq(_parser_key("ls", ["-lah"]), "ls")
 end
 
 def test_git_log_parse_commits():

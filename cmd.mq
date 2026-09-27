@@ -1928,8 +1928,7 @@ end
 
 # Returns the captures of the first pattern that matches the line, or {}.
 def _match_line(line, patterns):
-  let hits = filter(map(patterns, fn(p): _match_pattern(line, p);), fn(m): !is_empty(keys(m));)
-  | if (is_empty(hits)): {} else: hits[0]
+  fold(patterns, {}, fn(hit, p): if (is_empty(keys(hit))): _match_pattern(line, p) else: hit;)
 end
 
 # Returns the key of a `key`/`value` row, normalized when the spec asks for it.
@@ -2248,10 +2247,11 @@ end
 # Parser registry. Entries without a signature are used only when named.
 def _registry():
   [
-    {"key": "ps", "sig": "\\A\\s*(?:USER\\s+PID|UID\\s+PID|PID\\s+(?:TTY|TT)\\s)", "parse": {"type": "columns"}, "fields": {"pid": {"type": "int"}, "ppid": {"type": "int"}, "cpu_percent": {"type": "int"}, "mem_percent": {"type": "int"}, "vsz": {"type": "int"}, "rss": {"type": "int"}}},
+    {"key": "ps", "sig": "\\A\\s*(?:USER\\s+PID|UID\\s+PID|PID\\s+(?:TTY|TT|COMMAND|CMD|COMM)\\b)", "parse": {"type": "columns"}, "fields": {"pid": {"type": "int"}, "ppid": {"type": "int"}, "cpu_percent": {"type": "int"}, "mem_percent": {"type": "int"}, "vsz": {"type": "int"}, "rss": {"type": "int"}}},
     {"key": "df", "sig": "\\A(?:df: [^\\n]*\\n)*Filesystem\\s+", "parse": {"type": "columns", "replace": [["Mounted on", "Mounted_on"]]}, "fields": {"filesystem": {"type": "string"}, "mounted_on": {"type": "string"}, "*": {"type": "int"}}},
     {"key": "du", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<size>[^\\t]*)\\t(?<path>.*)$"]}, "fields": {"size": {"type": "int"}}},
-    {"key": "ls", "sig": "\\A(?:total \\d+\\n)?(?:[-dlbcps][-rwxsStT]{9}[@+.]?\\s+\\d+\\s+\\S+\\s+\\S+\\s+\\d+\\s+\\w{3}\\s+\\d{1,2}\\s+(?:\\d{2}:\\d{2}|\\d{4})\\s+[^\\n]+\\n)*[-dlbcps][-rwxsStT]{9}[@+.]?\\s+\\d+\\s+\\S+\\s+\\S+\\s+\\d+\\s+\\w{3}\\s+\\d{1,2}\\s+(?:\\d{2}:\\d{2}|\\d{4})\\s+[^\\n]+\\n*\\z", "parse": {"type": "regex", "patterns": ["^(?<permissions>[l]\\S{9,10})\\s+(?<links>\\d+)\\s+(?<owner>\\S+)\\s+(?<group>\\S+)\\s+(?<size>\\d+)\\s+(?<modified>\\w{3}\\s+\\d{1,2}\\s+(?:\\d{2}:\\d{2}|\\d{4}))\\s+(?<name>.*?) -> (?<link_target>.*)$", "^(?<permissions>[-dlbcps]\\S{9,10})\\s+(?<links>\\d+)\\s+(?<owner>\\S+)\\s+(?<group>\\S+)\\s+(?<size>\\d+)\\s+(?<modified>\\w{3}\\s+\\d{1,2}\\s+(?:\\d{2}:\\d{2}|\\d{4}))\\s+(?<name>.*)$"]}, "fields": {"links": {"type": "int"}, "size": {"type": "int"}, "modified": {"squeeze": true}, "type": {"derive": {"op": "prefix", "from": "permissions", "map": {"d": "directory", "l": "symlink", "-": "file"}, "default": "other"}}}},
+    {"key": "ls", "sig": "\\A(?:total \\d+\\n)?(?:[-dlbcps][-rwxsStT]{9}[@+.]?\\s+\\d+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\w{3}\\s+\\d{1,2}\\s+(?:\\d{2}:\\d{2}|\\d{4})\\s+[^\\n]+\\n)*[-dlbcps][-rwxsStT]{9}[@+.]?\\s+\\d+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\w{3}\\s+\\d{1,2}\\s+(?:\\d{2}:\\d{2}|\\d{4})\\s+[^\\n]+\\n*\\z", "parse": {"type": "regex", "patterns": ["^(?<permissions>[l]\\S{9,10})\\s+(?<links>\\d+)\\s+(?<owner>\\S+)\\s+(?<group>\\S+)\\s+(?<size>\\S+)\\s+(?<modified>\\w{3}\\s+\\d{1,2}\\s+(?:\\d{2}:\\d{2}|\\d{4}))\\s+(?<name>.*?) -> (?<link_target>.*)$", "^(?<permissions>[-dlbcps]\\S{9,10})\\s+(?<links>\\d+)\\s+(?<owner>\\S+)\\s+(?<group>\\S+)\\s+(?<size>\\S+)\\s+(?<modified>\\w{3}\\s+\\d{1,2}\\s+(?:\\d{2}:\\d{2}|\\d{4}))\\s+(?<name>.*)$"]}, "fields": {"links": {"type": "int"}, "size": {"type": "int"}, "modified": {"squeeze": true}, "type": {"derive": {"op": "prefix", "from": "permissions", "map": {"d": "directory", "l": "symlink", "-": "file"}, "default": "other"}}}},
+    {"key": "ls short", "sig": None, "parse": {"type": "regex", "patterns": ["^(?<name>.*)$"]}},
     {"key": "id", "sig": "\\A\\s*uid=\\d+(?:\\([^)\\n]*\\))? gid=\\d+[^\\n]*\\n*\\z", "parse": {"type": "record", "require": ["uid", "gid"], "captures": [{"re": "\\buid=(?<uid>\\d+)(?:\\((?<user>[^)]*)\\))?"}, {"re": "\\bgid=(?<gid>\\d+)(?:\\((?<group>[^)]*)\\))?"}, {"within": "\\bgroups=(?<value>\\S+)", "re": "(?<id>\\d+)(?:\\((?<name>[^)]*)\\))?", "all": true, "into": "groups", "fields": {"id": {"type": "int"}}}]}, "fields": {"uid": {"type": "int"}, "gid": {"type": "int"}}},
     {"key": "wc", "sig": None, "parse": {"type": "regex", "patterns": ["^\\s*(?<lines>\\d+)\\s+(?<words>\\d+)\\s+(?<bytes>\\d+)(?:\\s+(?<file>.*))?$"]}, "fields": {"lines": {"type": "int"}, "words": {"type": "int"}, "bytes": {"type": "int"}}},
     {"key": "ping", "sig": "packets transmitted, \\d+ (?:packets )?received", "parse": {"type": "record", "require": ["transmitted", "loss_percent"], "patterns": ["(?<transmitted>\\d+) packets transmitted, (?<received>\\d+) (?:packets )?received", "(?<loss_percent>[\\d.]+)% packet loss", "= (?<rtt_min>[\\d.]+)/(?<rtt_avg>[\\d.]+)/(?<rtt_max>[\\d.]+)/(?<rtt_stddev>[\\d.]+) ms"]}, "fields": {"*": {"type": "float"}}},
@@ -2620,7 +2620,8 @@ def _parser_key(cmd, args):
   | let with_sub = name + " " + sub
   | let flagged = _flag_variant(with_sub, args)
   | let variant = if (flagged != with_sub): flagged else: _option_variant(name, args, with_sub)
-  | if ((sub != "" || variant != with_sub) && !is_none(_find(variant))): variant
+  | if (name == "ls" && !_has_short_flag(args, "l") && !contains(args, "--format=long")): "ls short"
+    elif ((sub != "" || variant != with_sub) && !is_none(_find(variant))): variant
     elif (!is_none(_find(name))): name
     elif (sub != ""): variant
     else: name
@@ -2634,6 +2635,13 @@ end
 # Returns whether a signature matches the text.
 def _fits(output, sig):
   is_regex_match(_window(output), "(?m)" + sig)
+end
+
+# Matches signatures against one shared, bounded window and keeps their
+# registry entries so automatic parsing does not look up the winner again.
+def _matching_entries(output):
+  let window = _window(output)
+  | filter(_registry(), fn(entry): !is_none(entry["sig"]) && is_regex_match(window, "(?m)" + entry["sig"]);)
 end
 
 # Parses the output of a command with the parser registered for `key`, such
@@ -2656,7 +2664,11 @@ end
 def parse_output(key, output):
   let entry = _find(key)
   | if (is_none(entry)): error("cmd: no parser for `" + key + "`, use columns_parse, table_parse or kv_parse")
-    elif (!is_none(entry["sig"]) && trim(output) != "" && !_fits(output, entry["sig"])): error("cmd: the text does not look like `" + entry["key"] + "` output (" + (if (is_empty(detect(output))): "detect finds no match" else: "detect finds: " + join(detect(output), ", ")) + "). Call the parser function directly to skip this check")
+    elif (!is_none(entry["sig"]) && trim(output) != "" && !_fits(output, entry["sig"])):
+      do
+        let matches = detect(output)
+        | error("cmd: the text does not look like `" + entry["key"] + "` output (" + (if (is_empty(matches)): "detect finds no match" else: "detect finds: " + join(matches, ", ")) + "). Call the parser function directly to skip this check")
+      end
     else:
       _run_entry(entry, output)
 end
@@ -2671,7 +2683,7 @@ end
 #
 # Returns: array
 def detect(output):
-  filter(_registry(), fn(entry): !is_none(entry["sig"]) && _fits(output, entry["sig"]);)
+  _matching_entries(output)
   | map(fn(entry): entry["key"];)
 end
 
@@ -2687,10 +2699,10 @@ end
 #
 # Returns: array or dict
 def parse_auto(output):
-  let candidates = detect(output)
-  | if (len(candidates) == 1): parse_output(candidates[0], output)
+  let candidates = _matching_entries(output)
+  | if (len(candidates) == 1): _run_entry(candidates[0], output)
     elif (is_empty(candidates)): error("cmd: could not detect the command, name a parser with parse_output(key, output)")
-    else: error("cmd: ambiguous output, candidates: " + join(candidates, ", ") + ". Name a parser with parse_output(key, output)")
+    else: error("cmd: ambiguous output, candidates: " + join(map(candidates, fn(entry): entry["key"];), ", ") + ". Name a parser with parse_output(key, output)")
 end
 
 # Runs a command and parses its output with the parser for the command name

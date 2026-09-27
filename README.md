@@ -26,6 +26,13 @@ Let `parse_auto()` identify output with a distinctive format:
 df -k | mq -L . -I raw -F json 'import "cmd" | cmd::parse_auto(.)'
 ```
 
+`ls -l` and `ls -lh` output can also be detected automatically. A plain
+`ls` listing has no distinctive format; name its parser explicitly:
+
+```sh
+ls | mq -L . -I raw -F json 'import "cmd" | cmd::parse_output("ls short", .)'
+```
+
 Run and parse a command in one call. `run()` requires mq's `--allow-run` option:
 
 ```sh
@@ -44,6 +51,10 @@ openssl x509 -in cert.pem -noout -text | mq -L . -I raw -F json 'import "cmd" | 
 - `parse_auto(output)` detects a distinctive format. It raises an error if no parser matches or the result is ambiguous.
 - `detect(output)` returns the matching parser keys.
 - `run(cmd, args = [])` runs a command and selects its parser from the command and arguments.
+
+`run("ls")` selects `ls short`, while `run("ls", ["-l"])` selects `ls`.
+For `ps` output with selected columns, keep the command column last so its
+arguments stay together (for example, `ps -o pid,command`).
 
 For output without a command-specific parser, use `columns_parse`, `table_parse`, `kv_parse`, `kv_blocks_parse`, or `lines_parse`. Generic parsers keep values as strings. Command-specific parsers convert fields that are plainly numeric.
 
